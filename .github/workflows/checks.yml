@@ -11,11 +11,11 @@ jobs:
   golangci:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-      - uses: golangci/golangci-lint-action@v6
+          go-version: '1.24'
+      - uses: golangci/golangci-lint-action@v8
         with:
           args: --timeout=3m
 
@@ -25,11 +25,11 @@ jobs:
       # These hooks will run separately in github actions
       SKIP: golangci-lint,check-docs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
       - uses: actions/setup-python@v5
       - name: Cache envtest assets
         uses: actions/cache@v4
@@ -42,10 +42,10 @@ jobs:
   compat-tests:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.24'
       - name: Cache envtest assets
         uses: actions/cache@v4
         with:

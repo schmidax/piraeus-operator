@@ -18,9 +18,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	linstor "github.com/LINBIT/golinstor"
@@ -30,7 +30,7 @@ import (
 	"golang.org/x/exp/slices"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -51,7 +51,9 @@ import (
 
 	piraeusiov1 "github.com/piraeusdatastore/piraeus-operator/v2/api/v1"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/barepodpatch"
+	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/clusterapi"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/conditions"
+	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/evacuation"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/imageversions"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/linstorhelper"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/resources"
@@ -63,9 +65,11 @@ import (
 // LinstorSatelliteReconciler reconciles a LinstorSatellite object
 type LinstorSatelliteReconciler struct {
 	client.Client
+	MachineClient      *clusterapi.Client
 	Scheme             *runtime.Scheme
 	Namespace          string
 	ImageConfigMapName string
+	RequeueInterval    time.Duration
 	LinstorClientOpts  []lapi.Option
 	Kustomizer         *resources.Kustomizer
 	log                logr.Logger
@@ -78,6 +82,7 @@ type LinstorSatelliteReconciler struct {
 //+kubebuilder:rbac:groups="apps",resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 //+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -87,7 +92,7 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	lsatellite := &piraeusiov1.LinstorSatellite{}
 	err := r.Get(ctx, req.NamespacedName, lsatellite)
 	if err != nil {
-		if errors.IsNotFound(err) {
+		if k8serrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
 
@@ -96,13 +101,13 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	var node corev1.Node
 	err = r.Get(ctx, req.NamespacedName, &node)
-	if err != nil && !errors.IsNotFound(err) {
+	if err != nil && !k8serrors.IsNotFound(err) {
 		return ctrl.Result{}, err
 	}
 
 	conds := conditions.New()
 
-	var applyErr, stateErr error
+	var applyErr error
 	if node.Name != "" {
 		applyErr = r.reconcileAppliedResource(ctx, lsatellite, &node)
 		if applyErr != nil {
@@ -110,22 +115,25 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		} else {
 			conds.AddSuccess(conditions.Applied, "Resources applied")
 		}
-
-		stateErr = r.reconcileLinstorSatelliteState(ctx, lsatellite, &node, conds)
 	}
 
-	var deleteErr error
+	var deleteErr, stateErr error
 	if lsatellite.GetDeletionTimestamp() != nil {
-		deleteErr = r.deleteSatellite(ctx, lsatellite)
-		if deleteErr != nil {
-			conds.AddError("EvacuationCompleted", deleteErr)
+		msg, done, err := r.deleteSatellite(ctx, lsatellite, &node, conds)
+		if err != nil {
+			conds.AddError("SatelliteDeleted", err)
+			deleteErr = err
+		} else if !done {
+			conds.AddInProgress("SatelliteDeleted", msg)
 		} else {
-			conds.AddSuccess("EvacuationCompleted", "evacuation complete")
+			conds.AddCompleted("SatelliteDeleted", fmt.Sprintf("deletion using '%s' policy complete", lsatellite.Spec.DeletionPolicy))
 		}
 	} else {
 		if controllerutil.AddFinalizer(lsatellite, vars.SatelliteFinalizer) {
 			deleteErr = r.Client.Update(ctx, lsatellite)
 		}
+
+		stateErr = r.reconcileLinstorSatelliteState(ctx, lsatellite, &node, conds)
 	}
 
 	_, condErr := controllerutil.CreateOrPatch(ctx, r.Client, lsatellite, func() error {
@@ -136,17 +144,18 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return nil
 	})
 
-	result := ctrl.Result{
-		RequeueAfter: 1 * time.Minute,
-	}
-
-	return utils.AnyResult(result, applyErr, stateErr, deleteErr, condErr)
+	return utils.AnyResult(ctrl.Result{RequeueAfter: r.RequeueInterval}, applyErr, stateErr, deleteErr, condErr)
 }
 
 func (r *LinstorSatelliteReconciler) reconcileAppliedResource(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite, node *corev1.Node) error {
 	resMap, err := r.kustomizeNodeResources(ctx, lsatellite, node)
 	if err != nil {
 		return err
+	}
+
+	if lsatellite.GetDeletionTimestamp() != nil && lsatellite.Spec.DeletionPolicy == piraeusiov1.DeletionPolicyDelete {
+		r.log.Info("Forcing deletion of Satellite resources because of deletion policy 'Delete'")
+		resMap = resmap.New()
 	}
 
 	for _, res := range resMap.Resources() {
@@ -308,6 +317,37 @@ func (r *LinstorSatelliteReconciler) kustomizeNodeResources(ctx context.Context,
 }
 
 func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite, node *corev1.Node, conds conditions.Conditions) error {
+	// machine might be nil if
+	// * the MachineClient is nil (integration disabled)
+	// * the cluster is not using ClusterAPI
+	// * the machine could not be found
+	// this is all expected, all functions are expected to deal with that.
+	machine, err := r.MachineClient.GetMachineForNode(ctx, node)
+	if err != nil {
+		conds.AddError(conditions.Available, err)
+		conds.AddUnknown(conditions.Configured, "failed to get ClusterAPI Machine")
+		return err
+	}
+
+	if lsatellite.Spec.DeletionPolicy == piraeusiov1.DeletionPolicyEvacuate {
+		err = r.MachineClient.PreventMachineDeletion(ctx, machine)
+		if err != nil {
+			conds.AddError(conditions.Available, err)
+			conds.AddUnknown(conditions.Configured, "failed to update ClusterAPI Machine")
+			return err
+		}
+	} else {
+		err = errors.Join(
+			r.MachineClient.AllowMachineDrain(ctx, machine),
+			r.MachineClient.AllowMachineTermination(ctx, machine),
+		)
+		if err != nil {
+			conds.AddError(conditions.Available, err)
+			conds.AddUnknown(conditions.Configured, "failed to update ClusterAPI Machine")
+			return err
+		}
+	}
+
 	lc, err := linstorhelper.NewClientForCluster(
 		ctx,
 		r.Client,
@@ -321,25 +361,11 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 		return err
 	}
 
-	var pods corev1.PodList
-	err = r.Client.List(ctx, &pods, client.MatchingLabels{vars.SatelliteNodeLabel: string(lsatellite.UID)})
+	pod, err := r.getReadyPod(ctx, lsatellite)
 	if err != nil {
 		conds.AddError(conditions.Available, err)
-		conds.AddUnknown(conditions.Configured, "Missing Pod")
+		conds.AddUnknown(conditions.Configured, "Pod not ready")
 		return err
-	}
-
-	if len(pods.Items) != 1 {
-		conds.AddError(conditions.Available, fmt.Errorf("expected one Pod, got %d", len(pods.Items)))
-		conds.AddUnknown(conditions.Configured, "Missing Pod")
-		return nil
-	}
-	pod := &pods.Items[0]
-
-	if len(pod.Status.PodIPs) == 0 {
-		conds.AddError(conditions.Available, fmt.Errorf("missing IP address on pod"))
-		conds.AddUnknown(conditions.Configured, "missing IP address on pod")
-		return nil
 	}
 
 	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -355,6 +381,10 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 	if err != nil {
 		conds.AddError(conditions.Configured, err)
 		return err
+	}
+
+	if clusterapi.ShouldEvacuateNode(machine) {
+		props[linstor.KeyAutoplaceAllowTarget] = "false"
 	}
 
 	var netIfs []lapi.NetInterface
@@ -415,6 +445,23 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 			conds.AddError(conditions.Configured, err)
 		} else {
 			conds.AddSuccess(conditions.Configured, "Pools configured")
+		}
+
+		if clusterapi.ShouldEvacuateNode(machine) && lsatellite.Spec.DeletionPolicy == piraeusiov1.DeletionPolicyEvacuate {
+			r.log.Info("Request to evacuate node from ClusterAPI")
+			msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, lnode, r.MachineClient, machine)
+			if err != nil {
+				conds.AddError("SatelliteEvacuated", err)
+			} else if !done {
+				conds.AddInProgress("SatelliteEvacuated", msg)
+			} else {
+				conds.AddCompleted("SatelliteEvacuated", "LINSTOR Satellite evacuated")
+			}
+		} else if slices.Contains(lnode.Flags, linstor.FlagEvacuate) || slices.Contains(lnode.Flags, linstor.FlagEvicted) {
+			err := lc.Nodes.Restore(ctx, lnode.Name, lapi.NodeRestore{})
+			if err != nil {
+				conds.AddError(conditions.Configured, err)
+			}
 		}
 	} else {
 		conds.AddError(conditions.Available, fmt.Errorf("satellite not online"))
@@ -516,9 +563,20 @@ func (r *LinstorSatelliteReconciler) reconcileStoragePools(ctx context.Context, 
 	return nil
 }
 
-func (r *LinstorSatelliteReconciler) deleteSatellite(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite) error {
+// deleteSatellite tries to reconcile deletion of the satellites.
+//
+// Because this might take some time, and needs several attempts, this method returns
+// * A human-readable message of what is currently preventing satellite removal.
+// * true if the satellite was deleted, false otherwise.
+// * Any errors that prevented further progress.
+func (r *LinstorSatelliteReconciler) deleteSatellite(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite, node *corev1.Node, conds conditions.Conditions) (string, bool, error) {
 	if !controllerutil.ContainsFinalizer(lsatellite, vars.SatelliteFinalizer) {
-		return nil
+		return "", true, nil
+	}
+
+	machine, err := r.MachineClient.GetMachineForNode(ctx, node)
+	if err != nil {
+		return "", false, err
 	}
 
 	lc, err := linstorhelper.NewClientForCluster(
@@ -529,46 +587,76 @@ func (r *LinstorSatelliteReconciler) deleteSatellite(ctx context.Context, lsatel
 		r.LinstorClientOpts...,
 	)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 
 	if lc == nil {
-		r.log.Info("Removing finalizer from resource without cluster")
-		controllerutil.RemoveFinalizer(lsatellite, vars.SatelliteFinalizer)
-		return r.Client.Update(ctx, lsatellite)
-	}
-
-	err = lc.Nodes.Evacuate(ctx, lsatellite.Name)
-	if err != nil && err != lapi.NotFoundError {
-		return err
-	}
-
-	ress, err := lc.Resources.GetResourceView(ctx, &lapi.ListOpts{Node: []string{lsatellite.Name}})
-	if err != nil && err != lapi.NotFoundError {
-		return err
-	}
-
-	if len(ress) > 0 {
-		resNames := make([]string, 0, len(ress))
-		for _, r := range ress {
-			resNames = append(resNames, r.Name)
+		r.log.Info("Allow Machine to drain for Satellite without cluster")
+		err := r.MachineClient.AllowMachineDrain(ctx, machine)
+		if err != nil {
+			return "", false, err
 		}
 
-		return fmt.Errorf("remaining resources: %s", strings.Join(resNames, ", "))
+		r.log.Info("Allow Machine to terminate for Satellite without cluster")
+		err = r.MachineClient.AllowMachineTermination(ctx, machine)
+		if err != nil {
+			return "", false, err
+		}
+
+		r.log.Info("Removing finalizer from Satellite without cluster")
+		controllerutil.RemoveFinalizer(lsatellite, vars.SatelliteFinalizer)
+		err = r.Client.Update(ctx, lsatellite)
+		if err != nil {
+			return "", false, err
+		}
+
+		return "", true, nil
 	}
 
-	err = lc.Nodes.Delete(ctx, lsatellite.Name)
-	if err != nil && err != lapi.NotFoundError {
-		return err
+	r.log.Info("Deleting Satellite", "Policy", lsatellite.Spec.DeletionPolicy)
+	switch lsatellite.Spec.DeletionPolicy {
+	case piraeusiov1.DeletionPolicyEvacuate:
+		lnode, err := lc.Nodes.Get(ctx, lsatellite.Name)
+		if err != nil {
+			if errors.Is(err, lapi.NotFoundError) {
+				// If the node is already remove, skip everything
+				break
+			}
+
+			return "", false, err
+		}
+
+		msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, &lnode, r.MachineClient, machine)
+		if err != nil {
+			conds.AddError("SatelliteEvacuated", err)
+			return "", false, err
+		} else if !done {
+			conds.AddInProgress("SatelliteEvacuated", msg)
+			return msg, done, nil
+		} else {
+			err = lc.Nodes.Delete(ctx, lsatellite.Name)
+			if err != nil && !errors.Is(err, lapi.NotFoundError) {
+				return "", false, err
+			}
+
+			conds.AddCompleted("SatelliteEvacuated", "LINSTOR Satellite evacuated")
+		}
+	case piraeusiov1.DeletionPolicyDelete:
+		err := lc.Nodes.Lost(ctx, lsatellite.Name)
+		if err != nil && !errors.Is(err, lapi.NotFoundError) {
+			return "", false, err
+		}
+	case "", piraeusiov1.DeletionPolicyRetain:
+		r.log.Info("Nothing to do for deletion of satellite with 'Retain' deletion policy")
 	}
 
 	controllerutil.RemoveFinalizer(lsatellite, vars.SatelliteFinalizer)
 	err = r.Client.Update(ctx, lsatellite)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 
-	return nil
+	return "", true, nil
 }
 
 func (r *LinstorSatelliteReconciler) kustomLabels(uuid types.UID, instance string) []kusttypes.Label {
@@ -586,6 +674,32 @@ func (r *LinstorSatelliteReconciler) kustomLabels(uuid types.UID, instance strin
 			Pairs: vars.ExtraLabels,
 		},
 	}
+}
+
+func (r *LinstorSatelliteReconciler) getReadyPod(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite) (*corev1.Pod, error) {
+	var pods corev1.PodList
+
+	err := r.Client.List(ctx, &pods, client.MatchingLabels{vars.SatelliteNodeLabel: string(lsatellite.UID)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch Pods with label '%s=%s': %w", vars.SatelliteNodeLabel, lsatellite.UID, err)
+	}
+
+	if len(pods.Items) != 1 {
+		return nil, fmt.Errorf("expected one Pod, got %d with label '%s=%s'", len(pods.Items), vars.SatelliteNodeLabel, lsatellite.UID)
+	}
+	pod := &pods.Items[0]
+
+	if len(pod.Status.PodIPs) == 0 {
+		return nil, fmt.Errorf("no assinged IP address for Pod '%s'", pod.Name)
+	}
+
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+			return pod, nil
+		}
+	}
+
+	return nil, fmt.Errorf("'%s' not ready", pod.Name)
 }
 
 // SetupWithManager sets up the controller with the Manager.

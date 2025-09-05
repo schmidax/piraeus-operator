@@ -67,6 +67,38 @@ spec:
             operator: DoesNotExist
 ```
 
+### `.spec.tolerations`
+
+Sets additional tolerations to pass to the Cluster components. Piraeus Datastore components tolerate the following
+Taints:
+
+* `node.kubernetes.io/not-ready:NoExecute`
+* `node.kubernetes.io/unreachable:NoExecute`
+* `node.kubernetes.io/disk-pressure:NoSchedule`
+* `node.kubernetes.io/memory-pressure:NoSchedule`
+* `node.kubernetes.io/pid-pressure:NoSchedule`
+* `node.kubernetes.io/unschedulable:NoSchedule`
+* `node.kubernetes.io/network-unavailable:NoSchedule`
+* `drbd.linbit.com/force-io-error:NoSchedule`
+* `drbd.linbit.com/lost-quorum:NoSchedule`
+
+They match the default tolerations added to DaemonSet, as well as specific Taints added by the Piraeus HA Controller.
+
+#### Example
+
+This example allows Piraeus Datastore components to run on control-plane nodes:
+
+```yaml
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec:
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      effect: NoSchedule
+      operator: Exists
+```
 
 ### `.spec.repository`
 
@@ -210,6 +242,7 @@ spec:
 ### `.spec.controller`
 
 Controls the LINSTOR Controller Deployment:
+
 * Setting `enabled: false` disables the controller deployment entirely. See also [`.spec.externalController`](#specexternalcontroller).
 * Setting a `podTemplate:` allows for simple modification of the LINSTOR Controller Deployment.
 
@@ -237,12 +270,14 @@ spec:
 ### `.spec.csiController`
 
 Controls the CSI Controller Deployment:
+
 * Setting `enabled: false` disables the deployment entirely.
+* Setting `replicas:` sets the desired number of Pods for the Deployment.
 * Setting a `podTemplate:` allows for simple modification of the CSI Controller Deployment.
 
 #### Example
 
-This example configures a resource request of `cpu: 10m` for the CSI Controller Deployment:
+This example configures 2 replicas and a resource request of `memory: 1Gi` for the CSI Controller Deployment:
 
 ```yaml
 apiVersion: piraeus.io/v1
@@ -252,6 +287,7 @@ metadata:
 spec:
   csiController:
     enabled: true
+    replicas: 2
     podTemplate:
       spec:
         containers:
@@ -264,12 +300,13 @@ spec:
 ### `.spec.csiNode`
 
 Controls the CSI Node DaemonSet:
+
 * Setting `enabled: false` disables the deployment entirely.
 * Setting a `podTemplate:` allows for simple modification of the CSI Node DaemonSet.
 
 #### Example
 
-This example configures a resource request of `cpu: 10m` for the CSI Node DaemonSet:
+This example configures a resource request of `memory: 1Gi` for the CSI Node DaemonSet:
 
 ```yaml
 apiVersion: piraeus.io/v1
@@ -291,12 +328,13 @@ spec:
 ### `.spec.highAvailabilityController`
 
 Controls the High Availability Controller DaemonSet:
+
 * Setting `enabled: false` disables the deployment entirely.
-* Setting a `podTemplate:` allows for simple modification of the CSI Node Deployment.
+* Setting a `podTemplate:` allows for simple modification of the High Availability Controller DaemonSet.
 
 #### Example
 
-This example configures a resource request of `cpu: 10m` for the CSI Node Deployment:
+This example configures a resource request of `memory: 1Gi` for the High Availability Controller DaemonSet:
 
 ```yaml
 apiVersion: piraeus.io/v1
@@ -315,9 +353,40 @@ spec:
                 memory: 1Gi
 ```
 
+### `.spec.affinityController`
+
+Controls the Affinity Controller Deployment:
+
+* Setting `enabled: false` disables the deployment entirely.
+* Setting `replicas:` sets the desired number of Pods for the Deployment.
+* Setting a `podTemplate:` allows for simple modification of the Affinity Controller Deployment.
+
+#### Example
+
+This example configures 3 replicas and a resource request of `memory: 1Gi` for the Affinity Controller Deployment:
+
+```yaml
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec:
+  affinityController:
+    enabled: true
+    replicas: 3
+    podTemplate:
+      spec:
+        containers:
+          - name: linstor-affinity-controller
+            resources:
+              requests:
+                memory: 1Gi
+```
+
 ### `.spec.internalTLS`
 
 Configures a TLS secret used by the LINSTOR Controller to:
+
 * Validate the certificate of the LINSTOR Satellites, that is the Satellites must have certificates signed by `ca.crt`.
 * Provide a client certificate for authentication with LINSTOR Satellites, that is `tls.key` and `tls.crt` must be accepted by the Satellites.
 

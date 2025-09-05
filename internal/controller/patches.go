@@ -1,9 +1,7 @@
 package controller
 
 import (
-	"bytes"
 	"encoding/json"
-	"io"
 	"io/fs"
 	"strings"
 
@@ -82,6 +80,24 @@ func ClusterCSIControllerNodeAffinityPatch(affinity *corev1.NodeSelector) ([]kus
 	return render(
 		cluster.Resources,
 		"patches/csi-controller-node-affinity.yaml",
+		map[string]any{
+			"NODE_AFFINITY": affinity,
+		})
+}
+
+func ClusterAffinityControllerNodeSelector(selector map[string]string) ([]kusttypes.Patch, error) {
+	return render(
+		cluster.Resources,
+		"patches/affinity-controller-selector.yaml",
+		map[string]any{
+			"NODE_SELECTOR": selector,
+		})
+}
+
+func ClusterAffinityControllerNodeAffinityPatch(affinity *corev1.NodeSelector) ([]kusttypes.Patch, error) {
+	return render(
+		cluster.Resources,
+		"patches/affinity-controller-node-affinity.yaml",
 		map[string]any{
 			"NODE_AFFINITY": affinity,
 		})
@@ -174,6 +190,16 @@ func ClusterCSIControllerApiTLSPatch(controllerSecret string, caRef *piraeusiov1
 		map[string]any{
 			"LINSTOR_CSI_CONTROLLER_API_TLS_SECRET_NAME": controllerSecret,
 			"LINSTOR_CSI_CONTROLLER_API_TLS_CA_SOURCE":   caRef.ToEnvVarSource(controllerSecret),
+		})
+}
+
+func ClusterAffinityControllerApiTLSPatch(controllerSecret string, caRef *piraeusiov1.CAReference) ([]kusttypes.Patch, error) {
+	return render(
+		cluster.Resources,
+		"patches/api-tls-affinity-controller.yaml",
+		map[string]any{
+			"LINSTOR_AFFINITY_CONTROLLER_API_TLS_SECRET_NAME": controllerSecret,
+			"LINSTOR_AFFINITY_CONTROLLER_API_TLS_CA_SOURCE":   caRef.ToEnvVarSource(controllerSecret),
 		})
 }
 
@@ -276,6 +302,28 @@ func SatelliteHostPathVolumeEnvPatch(hostPaths []string) ([]kusttypes.Patch, err
 	)
 }
 
+func TolerationsPatch(kind, name string, tolerations []corev1.Toleration) ([]kusttypes.Patch, error) {
+	patches, err := render(
+		cluster.Resources,
+		"patches/tolerations.yaml",
+		map[string]any{
+			"KIND":        kind,
+			"NAME":        name,
+			"TOLERATIONS": tolerations,
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range patches {
+		patches[i].Target = &kusttypes.Selector{
+			ResId: resid.NewResIdKindOnly(kind, name),
+		}
+	}
+
+	return patches, nil
+}
+
 func ComponentPodTemplate(kind, name string, template json.RawMessage) ([]kusttypes.Patch, error) {
 	patches, err := render(
 		cluster.Resources,
@@ -299,22 +347,37 @@ func ComponentPodTemplate(kind, name string, template json.RawMessage) ([]kustty
 	return patches, nil
 }
 
-func render(f fs.FS, fileName string, params map[string]any) ([]kusttypes.Patch, error) {
-	raw, err := f.Open(fileName)
+func ComponentReplicasPatch(kind, name string, replicas int32) ([]kusttypes.Patch, error) {
+	patches, err := render(
+		cluster.Resources,
+		"patches/replicas-patch.yaml",
+		map[string]any{
+			"KIND":     kind,
+			"NAME":     name,
+			"REPLICAS": replicas,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	defer raw.Close()
+	for i := range patches {
+		patches[i].Target = &kusttypes.Selector{
+			ResId: resid.NewResIdKindOnly(kind, name),
+		}
+	}
 
-	buf := bytes.Buffer{}
-	_, err = io.Copy(&buf, raw)
+	return patches, nil
+}
+
+func render(f fs.FS, fileName string, params map[string]any) ([]kusttypes.Patch, error) {
+	raw, err := fs.ReadFile(f, fileName)
 	if err != nil {
 		return nil, err
 	}
 
 	var patches []kusttypes.Patch
-	err = yaml.Unmarshal(buf.Bytes(), &patches)
+	err = yaml.Unmarshal(raw, &patches)
 	if err != nil {
 		return nil, err
 	}

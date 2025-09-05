@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Deploy [LINSTOR Affinity Controller] as part of Piraeus Datastore.
+- Add option to set replica count for Deployment components.
+- Integration with ClusterAPI to enable graceful node evacuation in case of rolling machine updates.
+
+[LINSTOR Affinity Controller]: https://github.com/piraeusdatastore/linstor-affinity-controller
+
+### Removed
+
+- Removed image configuration for EOL distributions:
+  * Ubuntu 18.04 ("Bionic Beaver")
+  * Ubuntu 20.04 ("Focal Fossa")
+  * CentOS 7
+  * Debian 10 ("Buster")
+
+### Changed
+
+- Image configuration for RHEL10 clones.
+- Do not remove existing satellites for `*NoSchedule` taints.
+
+### Fixed
+
+- Fix a crash in the validation webhook when trying to change the type of storage pool.
+
+## [v2.9.0] - 2025-06-17
+
+### Added
+
+- Support for different deletion policies on satellites.
+- Option to select taints that should be tolerated by Piraeus Datastore.
+- Allow pinning images in the image configuration to a specific digest.
+- Support overriding image configuration directly on the Operator Deployment using `RELATED_IMAGE_*` environment variables.
+
+### Changed
+
+- Deletion of `LinstorSatellite` no longer causes a node evacuation by default. See [`spec.deletionPolicy`](./reference/linstorsatelliteconfiguration.md#specdeletionpolicy).
+- Piraeus Datastore no longer runs on control plane nodes by default.
+- "Inconsistent" resources no longer cause AlertManager notifications, as long as there is resync progress.
+- Updated images:
+  * LINSTOR 1.31.2
+  * LINSTOR CSI 1.8.0
+  * DRBD 9.2.14
+  * kTLS-utils 1.1.0
+  * Latest CSI sidecars
+
+## [v2.8.1] - 2025-04-09
+
+### Added
+
+- Option to set the maximum time between reconciliations.
+
+### Changed
+
+- Updated default properties applied on controller level to match LINSTOR release 1.31.0
+- Updated images:
+    * LINSTOR 1.31.0
+    * LINSTOR CSI 1.7.1
+    * DRBD 9.2.13
+    * Latest CSI sidecars
+
+### Fixed
+
+- Fix Operator caches not being index by a comparable key, leading to cache misses and a memory leak.
+- Fix missing `ports:` section on LINSTOR Satellites, need for certain network mesh solutions.
+
 ## [v2.8.0] - 2025-02-13
 
 ### Added
@@ -996,4 +1062,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v2.7.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.7.0...v2.7.1
 
 [v2.8.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.7.1...v2.8.0
-[Unreleased]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.8.0...HEAD
+[v2.8.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.8.0...v2.8.1
+[v2.9.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.8.1...v2.9.0
+[Unreleased]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.9.0...HEAD

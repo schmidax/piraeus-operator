@@ -76,6 +76,23 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		{
+			name: "ClusterAffinityControllerNodeSelector",
+			call: func() ([]kusttypes.Patch, error) {
+				return controller.ClusterAffinityControllerNodeSelector(map[string]string{"foo": "bar"})
+			},
+		},
+		{
+			name: "ClusterAffinityControllerNodeAffinityPatch",
+			call: func() ([]kusttypes.Patch, error) {
+				return controller.ClusterAffinityControllerNodeAffinityPatch(&corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "example.com/label",
+						Operator: corev1.NodeSelectorOpDoesNotExist,
+					}}}},
+				})
+			},
+		},
+		{
 			name: "ClusterCSINodeSelectorPatch",
 			call: func() ([]kusttypes.Patch, error) {
 				return controller.ClusterCSINodeSelectorPatch(map[string]string{"foo": "bar"})
@@ -152,9 +169,21 @@ func TestPatches(t *testing.T) {
 			},
 		},
 		{
+			name: "TolerationsPatch",
+			call: func() ([]kusttypes.Patch, error) {
+				return controller.TolerationsPatch("DaemonSet", "linstor-csi-node", []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Effect: corev1.TaintEffectNoSchedule}})
+			},
+		},
+		{
 			name: "ComponentPodTemplate",
 			call: func() ([]kusttypes.Patch, error) {
 				return controller.ComponentPodTemplate("DaemonSet", "linstor-csi-node", json.RawMessage(`{"spec": {"hostNetwork": true}}`))
+			},
+		},
+		{
+			name: "ComponentReplicasPatch",
+			call: func() ([]kusttypes.Patch, error) {
+				return controller.ComponentReplicasPatch("Deployment", "linstor-affinity-controller", 2)
 			},
 		},
 		{
@@ -187,6 +216,15 @@ func TestPatches(t *testing.T) {
 			name: "ClusterCSIControllerApiTLSPatch",
 			call: func() ([]kusttypes.Patch, error) {
 				return controller.ClusterCSIControllerApiTLSPatch("controller", &piraeusiov1.CAReference{
+					Name: "trust-root",
+					Kind: "Secret",
+				})
+			},
+		},
+		{
+			name: "ClusterAffinityControllerApiTLSPatch",
+			call: func() ([]kusttypes.Patch, error) {
+				return controller.ClusterAffinityControllerApiTLSPatch("controller", &piraeusiov1.CAReference{
 					Name: "trust-root",
 					Kind: "Secret",
 				})

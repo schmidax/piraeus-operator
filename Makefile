@@ -4,7 +4,7 @@ PROJECT_NAME ?= piraeus-operator
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 2.8.0
+VERSION ?= 2.9.0
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -50,7 +50,7 @@ endif
 # Image URL to use all building/pushing image targets
 IMG ?= quay.io/piraeusdatastore/piraeus-operator:v$(VERSION)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
-ENVTEST_K8S_VERSION = 1.29
+ENVTEST_K8S_VERSION = $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 # ENVTEST_K8S_COMPAT_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary for
 # checking compatibility with older kubernetes versions.
 ENVTEST_K8S_COMPAT_VERSION = 1.20
@@ -95,13 +95,13 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	go run ./hack/csvinflater > config/manifests/csv-resource-patch.yaml
+	go run ./tools/csvinflater > config/manifests/csv-resource-patch.yaml
 	$(CONTROLLER_GEN) rbac:roleName=controller-manager crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	hack/crd-charts-copy.sh > charts/piraeus/templates/crds.yaml
+	tools/crd-charts-copy.sh > charts/piraeus/templates/crds.yaml
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+	$(CONTROLLER_GEN) object:headerFile="tools/boilerplate.go.txt" paths="./..."
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -178,9 +178,9 @@ ENVTEST_COMPAT ?= $(LOCALBIN)/setup-envtest-compat
 YQ ?= $(LOCALBIN)/yq
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v5.4.3
-CONTROLLER_TOOLS_VERSION ?= v0.16.1
-YQ_VERSION ?= v4.44.3
+KUSTOMIZE_VERSION ?= v5.6.0
+CONTROLLER_TOOLS_VERSION ?= v0.18.0
+YQ_VERSION ?= v4.45.4
 
 KUSTOMIZE_INSTALL_SCRIPT ?= "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"
 .PHONY: kustomize
@@ -201,9 +201,10 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 .PHONY: yq
 yq: $(YQ)
 $(YQ): $(LOCALBIN)
-	curl -sSLo "$(YQ)~" https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(shell go env GOOS)_$(shell go env GOARCH)
-	chmod +x "$(YQ)~"
-	mv -v "$(YQ)~" $(YQ)
+	@if ! test -x $(YQ) || ! $(YQ) --version | grep -q $(YQ_VERSION); then \
+		curl -sSLo "$(YQ)" https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(shell go env GOOS)_$(shell go env GOARCH); \
+		chmod +x $(YQ); \
+	fi
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
@@ -273,8 +274,17 @@ catalog-push: ## Push a catalog image.
 
 .PHONY: release
 release: $(YQ) $(KUSTOMIZE)
-	KUSTOMIZE=$(abspath $(KUSTOMIZE)) YQ=$(abspath $(YQ)) hack/make-release.sh $(VERSION)
+	KUSTOMIZE=$(abspath $(KUSTOMIZE)) YQ=$(abspath $(YQ)) tools/make-release.sh $(VERSION)
 
 .PHONY: sync-chart
-sync-chart:
-	hack/copy-image-config-to-chart.sh
+sync-chart: $(YQ) $(KUSTOMIZE)
+	tools/copy-image-config-to-chart.sh
+	KUSTOMIZE=$(abspath $(KUSTOMIZE)) YQ=$(abspath $(YQ)) tools/copy-rbac-config-to-chart.sh
+
+.PHONY: manifest.yaml
+manifest.yaml: $(KUSTOMIZE)
+	$(KUSTOMIZE) build config/default > $@
+
+.PHONY: changes.md
+changes.md:
+	hack/extract-changelog.sh v$(VERSION) > $@

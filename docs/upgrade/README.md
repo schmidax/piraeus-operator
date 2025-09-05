@@ -10,9 +10,50 @@ To upgrade, apply the resource of the latest release. Use the same method that w
 To upgrade to the latest release using `kubectl`, run the following commands:
 
 ```
-$ kubectl apply --server-side -k "https://github.com/piraeusdatastore/piraeus-operator//config/default?ref=v2.8.0"
+$ kubectl apply --server-side -f "https://github.com/piraeusdatastore/piraeus-operator/releases/latest/download/manifest.yaml"
 $ kubectl wait pod --for=condition=Ready -n piraeus-datastore --all
 ```
+
+# Upgrades from v2.8 to v2.9
+
+Generally, no special steps required.
+
+The default behaviour when deleting the `LinstorSatellite` resource has been changed. The Operator no longer causes
+the node to be evacuated by default. Instead, the LINSTOR Satellite is left unchanged. To restore the old behaviour,
+create the following resource:
+
+```yaml
+apiVersion: piraeus.io/v1
+kind: LinstorSatelliteConfiguration
+metadata:
+  name: satellite-deletion-policy
+spec:
+ deletionPolicy: Evacuate
+```
+
+The default behaviour of starting Piraeus Datastore components also on control plane nodes has been changed.
+Piraeus Datastore will no longer run on nodes tainted by the `node-role.kubernetes.io/control-plane:NoSchedule` or
+`node-role.kubernetes.io/master:NoSchedule` Taints. To restore the old behaviour, make the following change to the
+`LinstorCluster` resource:
+
+```yaml
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec:
+  tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+    operator: Exists
+  - key: node-role.kubernetes.io/worker
+    effect: NoSchedule
+    operator: Exists
+```
+
+# Upgrades from v2.7 to v2.8
+
+No special steps required.
 
 # Upgrades from v2.6 to v2.7
 

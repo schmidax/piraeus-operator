@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -44,6 +45,7 @@ import (
 	"github.com/piraeusdatastore/piraeus-operator/v2/internal/controller"
 	piraeuswebhook "github.com/piraeusdatastore/piraeus-operator/v2/internal/webhook"
 	webhookv1 "github.com/piraeusdatastore/piraeus-operator/v2/internal/webhook/v1"
+	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/clusterapi"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/linstorhelper"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/vars"
 	//+kubebuilder:scaffold:imports
@@ -69,8 +71,10 @@ func main() {
 	var namespace string
 	var pullSecret string
 	var imageConfigMapName string
+	var clusterApiKubeconfig string
 	var linstorApiQps float64
 	var nodeCacheDuration time.Duration
+	var requeueInterval time.Duration
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -79,8 +83,10 @@ func main() {
 	flag.StringVar(&namespace, "namespace", os.Getenv("NAMESPACE"), "The namespace to create resources in.")
 	flag.StringVar(&pullSecret, "pull-secret", os.Getenv("PULL_SECRET"), "The pull secret to use for all containers")
 	flag.StringVar(&imageConfigMapName, "image-config-map-name", os.Getenv("IMAGE_CONFIG_MAP_NAME"), "Config map holding default images to use")
+	flag.StringVar(&clusterApiKubeconfig, "cluster-api-kubeconfig", os.Getenv("CLUSTER_API_KUBECONFIG"), "Path to a kubeconfig file to use for interacting with ClusterAPI resources. Setting this to '<none>' disables ClusterAPI integration.")
 	flag.Float64Var(&linstorApiQps, "linstor-api-qps", 100.0, "Limit requests to the LINSTOR API to this many queries per second")
 	flag.DurationVar(&nodeCacheDuration, "linstor-node-cache-duration", 1*time.Minute, "Duration for which the results of node and storage pool related API responses should be cached.")
+	flag.DurationVar(&requeueInterval, "requeue-interval", 1*time.Minute, "Maximum time between reconciliation, even if no Kubernetes resource change was detected.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -102,9 +108,50 @@ func main() {
 		linstorhelper.PerClusterNodeCache(nodeCacheDuration),
 	}
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	restCfg := ctrl.GetConfigOrDie()
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	machineClientCfg := restCfg
+	if clusterApiKubeconfig == "<none>" {
+		machineClientCfg = nil
+	} else if clusterApiKubeconfig != "" {
+		rawCfg, err := os.ReadFile(clusterApiKubeconfig)
+		if err != nil {
+			setupLog.Error(err, "unable to read cluster api kubeconfig")
+			os.Exit(1)
+		}
+
+		clientCfg, err := clientcmd.NewClientConfigFromBytes(rawCfg)
+		if err != nil {
+			setupLog.Error(err, "unable to parse cluster api kubeconfig")
+			os.Exit(1)
+		}
+
+		machineClientCfg, err = clientCfg.ClientConfig()
+		if err != nil {
+			setupLog.Error(err, "unable to create rest config for cluster api kubeconfig")
+			os.Exit(1)
+		}
+	}
+
+	// We use a special client for ClusterAPI:
+	// 1. because we run into trouble with the default caching, as we try to restrict the cache to our own namespace,
+	//    but the Machine objects are likely in a completely different namespace.
+	// 2. because this is a nice way for users to specify another kubeconfig just for Machines. The ClusterAPI object
+	//    might be in a completely different Kubernetes cluster.
+	// 3. because this gives us a way to disable ClusterAPI integration by not configuring the client.
+	var machineClient *clusterapi.Client
+	if machineClientCfg != nil {
+		cl, err := clusterapi.NewClientForConfig(machineClientCfg)
+		if err != nil {
+			setupLog.Error(err, "unable to create cluster api client")
+			os.Exit(1)
+		}
+
+		machineClient = cl
+	}
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	mgr, err := ctrl.NewManager(restCfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsserver.Options{BindAddress: metricsAddr},
 		WebhookServer:          webhook.NewServer(webhook.Options{Port: 9443}),
@@ -124,6 +171,7 @@ func main() {
 		Namespace:          namespace,
 		ImageConfigMapName: imageConfigMapName,
 		PullSecret:         pullSecret,
+		RequeueInterval:    requeueInterval,
 		LinstorClientOpts:  linstorOpts,
 	}).SetupWithManager(mgr, crtController.Options{}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LinstorCluster")
@@ -131,9 +179,11 @@ func main() {
 	}
 	if err = (&controller.LinstorSatelliteReconciler{
 		Client:             mgr.GetClient(),
+		MachineClient:      machineClient,
 		Scheme:             mgr.GetScheme(),
 		Namespace:          namespace,
 		ImageConfigMapName: imageConfigMapName,
+		RequeueInterval:    requeueInterval,
 		LinstorClientOpts:  linstorOpts,
 	}).SetupWithManager(mgr, crtController.Options{}); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LinstorSatellite")
@@ -143,6 +193,7 @@ func main() {
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		Namespace:         namespace,
+		RequeueInterval:   requeueInterval,
 		LinstorClientOpts: linstorOpts,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LinstorNodeConnection")

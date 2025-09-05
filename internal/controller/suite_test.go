@@ -39,16 +39,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	"github.com/piraeusdatastore/piraeus-operator/v2/internal/controller"
-
 	piraeusiov1 "github.com/piraeusdatastore/piraeus-operator/v2/api/v1"
+	"github.com/piraeusdatastore/piraeus-operator/v2/internal/controller"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/k8sgc"
 	//+kubebuilder:scaffold:imports
 )
 
 const (
-	DefaultTimeout       = 30 * time.Second
-	DefaultCheckInterval = 5 * time.Second
+	defaultTimeout       = 30 * time.Second
+	defaultCheckInterval = 5 * time.Second
 	Namespace            = "piraeus-datastore"
 	ImageConfigMapName   = "image-config"
 	ExampleNodeName      = "node1.example.com"
@@ -59,10 +58,16 @@ var (
 	cfg           *rest.Config
 	k8sClient     client.Client
 	testEnv       *envtest.Environment
+	gc            k8sgc.GC
 )
 
 func TestAPIs(t *testing.T) {
 	RegisterFailHandler(Fail)
+
+	SetDefaultEventuallyTimeout(defaultTimeout)
+	SetDefaultConsistentlyDuration(defaultTimeout)
+	SetDefaultEventuallyPollingInterval(defaultCheckInterval)
+	SetDefaultConsistentlyPollingInterval(defaultCheckInterval)
 
 	RunSpecs(t, "Controller Suite")
 }
@@ -94,7 +99,7 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	//+kubebuilder:scaffold:scheme
-
+	cfg.WarningHandler = rest.NoWarnings{}
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
@@ -135,6 +140,7 @@ var _ = BeforeSuite(func() {
 		Scheme:             k8sManager.GetScheme(),
 		Namespace:          Namespace,
 		ImageConfigMapName: ImageConfigMapName,
+		RequeueInterval:    defaultCheckInterval,
 	}).SetupWithManager(k8sManager, opts)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -143,6 +149,7 @@ var _ = BeforeSuite(func() {
 		Scheme:             k8sManager.GetScheme(),
 		Namespace:          Namespace,
 		ImageConfigMapName: ImageConfigMapName,
+		RequeueInterval:    defaultCheckInterval,
 	}).SetupWithManager(k8sManager, opts)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -152,11 +159,11 @@ var _ = BeforeSuite(func() {
 		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
 	}()
 
+	gc, err = k8sgc.New(ctx, k8sClient)
+	Expect(err).ToNot(HaveOccurred(), "failed to create GC")
+
 	go func() {
 		defer GinkgoRecover()
-		gc, err := k8sgc.New(ctx, k8sClient)
-		Expect(err).ToNot(HaveOccurred(), "failed to create GC")
-
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
@@ -170,7 +177,7 @@ var _ = BeforeSuite(func() {
 					return
 				}
 
-				Expect(err).ToNot(HaveOccurred(), "failed to run GC")
+				Expect(err).ToNot(HaveOccurred(), "failed to run K8s GC")
 			}
 		}
 	}()
@@ -184,4 +191,13 @@ var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
+})
+
+var _ = AfterEach(func(ctx context.Context) {
+	_, err := gc.Run(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+
+	Expect(err).ToNot(HaveOccurred(), "failed to manually run K8s GC after test")
 })

@@ -39,10 +39,17 @@ type LinstorClusterSpec struct {
 	// +kubebuilder:validation:Optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
-	// NodeAffinity selects the nodes on which LINSTOR Satellite will be deployed.
+	// NodeAffinity selects the nodes on which LINSTOR Satellites will be deployed.
 	// See https://kubernetes.io/docs/concepts/configuration/assign-pod-node/
 	// +kubebuilder:validation:Optional
 	NodeAffinity *corev1.NodeSelector `json:"nodeAffinity,omitempty"`
+
+	// Tolerations selects the nodes on which LINSTOR Satellites will be deployed.
+	//
+	// The default tolerations for DaemonSets are automatically added.
+	// +kubebuilder:validation:Optional
+	// +listType=atomic
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
 	// Properties to apply on the cluster level.
 	//
@@ -93,7 +100,7 @@ type LinstorClusterSpec struct {
 
 	// CSIController controls the deployment of the CSI Controller Deployment.
 	// +kubebuilder:validation:Optional
-	CSIController *ComponentSpec `json:"csiController,omitempty"`
+	CSIController *DeploymentComponentSpec `json:"csiController,omitempty"`
 
 	// CSINode controls the deployment of the CSI Node DaemonSet.
 	// +kubebuilder:validation:Optional
@@ -102,6 +109,10 @@ type LinstorClusterSpec struct {
 	// HighAvailabilityController controls the deployment of the High Availability Controller DaemonSet.
 	// +kubebuilder:validation:Optional
 	HighAvailabilityController *ComponentSpec `json:"highAvailabilityController,omitempty"`
+
+	// AffinityController controls the deployment of the Affinity Controller Deployment.
+	// +kubebuilder:validation:Optional
+	AffinityController *DeploymentComponentSpec `json:"affinityController,omitempty"`
 }
 
 type LinstorExternalControllerRef struct {
@@ -130,6 +141,11 @@ type LinstorClusterApiTLS struct {
 	// the volume state. Defaults to "linstor-csi-node-tls".
 	//+kubebuilder:validation:Optional
 	CsiNodeSecretName string `json:"csiNodeSecretName,omitempty"`
+
+	// AffinityControllerSecretName references a secret holding the TLS key and certificate used by the CSI Controller
+	// to provision volumes. Defaults to "linstor-affinity-controller-tls".
+	//+kubebuilder:validation:Optional
+	AffinityControllerSecretName string `json:"affinityControllerSecretName,omitempty"`
 
 	// CertManager references a cert-manager Issuer or ClusterIssuer.
 	// If set, cert-manager.io/Certificate resources will be created, provisioning the secrets referenced in
@@ -173,6 +189,14 @@ func (l *LinstorClusterApiTLS) GetCsiNodeSecretName() string {
 	}
 
 	return l.CsiNodeSecretName
+}
+
+func (l *LinstorClusterApiTLS) GetAffinityControllerSecretName() string {
+	if l.AffinityControllerSecretName == "" {
+		return "linstor-affinity-controller-tls"
+	}
+
+	return l.AffinityControllerSecretName
 }
 
 // LinstorClusterStatus defines the observed state of LinstorCluster
