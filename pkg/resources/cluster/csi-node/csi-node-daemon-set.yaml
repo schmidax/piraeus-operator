@@ -19,6 +19,9 @@ spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
       serviceAccountName: linstor-csi-node
+      shareProcessNamespace: true
+      hostNetwork: true # For mounting NFS resources
+      dnsPolicy: ClusterFirstWithHostNet
       priorityClassName: system-node-critical
       initContainers:
         - name: linstor-wait-node-online
@@ -79,6 +82,14 @@ spec:
               mountPath: /dev
             - name: run-mount
               mountPath: /run/mount
+            - name: run-fsck
+              mountPath: /run/fsck
+            - name: etc-selinux
+              mountPath: /etc/selinux
+              readOnly: true
+            - name: sys
+              mountPath: /sys
+              readOnly: true
         - name: csi-node-driver-registrar
           image: csi-node-driver-registrar
           args:
@@ -93,11 +104,11 @@ spec:
                 - ALL
           ports:
             - containerPort: 9809
-              name: healthz
+              name: reg-healthz
           livenessProbe:
             httpGet:
               path: /healthz
-              port: healthz
+              port: reg-healthz
             initialDelaySeconds: 5
             timeoutSeconds: 5
           volumeMounts:
@@ -126,6 +137,14 @@ spec:
           hostPath:
             path: /var/lib/kubelet
             type: Directory
+        - name: etc-selinux
+          hostPath:
+            path: /etc/selinux
+            type: DirectoryOrCreate
+        - name: sys
+          hostPath:
+            path: /sys
+            type: Directory
         - name: registration-dir
           hostPath:
             path: /var/lib/kubelet/plugins_registry
@@ -138,3 +157,5 @@ spec:
           hostPath:
             path: /run/mount
             type: Directory
+        - name: run-fsck
+          emptyDir: {}

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -26,17 +27,22 @@ import (
 
 	lapi "github.com/LINBIT/golinstor/client"
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+	"github.com/go-logr/logr"
+	"github.com/go-openapi/jsonpointer"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	schedulingcorev1 "k8s.io/component-helpers/scheduling/corev1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -67,14 +73,16 @@ import (
 // LinstorClusterReconciler reconciles a LinstorCluster object
 type LinstorClusterReconciler struct {
 	client.Client
-	Scheme             *runtime.Scheme
-	Namespace          string
-	PullSecret         string
-	ImageConfigMapName string
-	RequeueInterval    time.Duration
-	LinstorClientOpts  []lapi.Option
-	Kustomizer         *resources.Kustomizer
-	APIVersion         *utils.APIVersion
+	Scheme                       *runtime.Scheme
+	Namespace                    string
+	PullSecret                   string
+	ImageConfigMapName           string
+	RequeueInterval              time.Duration
+	LinstorClientOpts            []lapi.Option
+	Kustomizer                   *resources.Kustomizer
+	APIVersion                   *utils.APIVersion
+	SupportsVolumeGroupSnapshots bool
+	log                          logr.Logger
 }
 
 //+kubebuilder:rbac:groups=piraeus.io,resources=linstorclusters,verbs=get;list;watch;create;update;patch;delete
@@ -94,6 +102,7 @@ type LinstorClusterReconciler struct {
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims/status,verbs=patch
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices;endpointslices/restricted,verbs=create;delete
 //+kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=internal.linstor.linbit.com,resources=*,verbs=get;list;watch;create;update;patch;delete;deletecollection
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch;create;update;patch;delete
@@ -102,9 +111,13 @@ type LinstorClusterReconciler struct {
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch;patch
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments/status,verbs=patch
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=csistoragecapacities,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattributesclasses,verbs=get;list;watch
 //+kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses;volumesnapshots,verbs=get;list;watch
-//+kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get;list;watch;patch;update;delete
+//+kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents,verbs=get;list;watch;patch;update
 //+kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotcontents/status,verbs=patch;update
+//+kubebuilder:rbac:groups=groupsnapshot.storage.k8s.io,resources=volumegroupsnapshotclasses;volumesnapshots,verbs=get;list;watch
+//+kubebuilder:rbac:groups=groupsnapshot.storage.k8s.io,resources=volumegroupsnapshotcontents,verbs=get;list;watch;patch;update
+//+kubebuilder:rbac:groups=groupsnapshot.storage.k8s.io,resources=volumegroupsnapshotcontents/status,verbs=patch;update
 //+kubebuilder:rbac:groups=cert-manager.io,resources=certificates,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=security.openshift.io,resources=securitycontextconstraints,resourceNames=privileged,verbs=use
 //+kube
@@ -129,11 +142,29 @@ func (r *LinstorClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		conds.AddSuccess(conditions.Applied, "Resources applied")
 	}
 
-	stateErr := r.reconcileClusterState(ctx, lcluster, conds)
+	status, stateErr := r.reconcileClusterState(ctx, lcluster, conds)
 
 	_, condErr := controllerutil.CreateOrPatch(ctx, r.Client, lcluster, func() error {
+		// Fill in existing conditions so meta.SetStatusCondition does not update the LastTransitionTime if the
+		// condition is already set.
+		status.Conditions = lcluster.Status.Conditions
+
 		for _, cond := range conds.ToConditions(lcluster.Generation) {
-			meta.SetStatusCondition(&lcluster.Status.Conditions, cond)
+			meta.SetStatusCondition(&status.Conditions, cond)
+		}
+
+		status.DeepCopyInto(&lcluster.Status)
+
+		if status.RunningSatellites != nil && status.ScheduledSatellites != nil {
+			lcluster.Status.Satellites = fmt.Sprintf("%d/%d", *status.RunningSatellites, *status.ScheduledSatellites)
+		}
+
+		if status.FreeCapacityBytes != nil && status.TotalCapacityBytes != nil {
+			// Report used/total capacity. Assume "used" is total - free. Always report in GiB.
+			lcluster.Status.Capacity = fmt.Sprintf("%d/%dGiB",
+				resource.NewQuantity(*status.TotalCapacityBytes-*status.FreeCapacityBytes, resource.BinarySI).ScaledValue(resource.Giga),
+				resource.NewQuantity(*status.TotalCapacityBytes, resource.BinarySI).ScaledValue(resource.Giga),
+			)
 		}
 
 		return nil
@@ -168,7 +199,7 @@ func (r *LinstorClusterReconciler) reconcileAppliedResource(ctx context.Context,
 		return err
 	}
 
-	resMap, err := r.kustomizeResources(ctx, lcluster, satelliteNodes.Items, satelliteConfigs.Items, existingSatellites.Items)
+	resMap, appliedConfigurations, err := r.kustomizeResources(ctx, lcluster, satelliteNodes.Items, satelliteConfigs.Items, existingSatellites.Items)
 	if err != nil {
 		return err
 	}
@@ -204,6 +235,17 @@ func (r *LinstorClusterReconciler) reconcileAppliedResource(ctx context.Context,
 				ObservedGeneration: config.Generation,
 			})
 
+			config.Status.AppliedTo = nil
+			for node, configs := range appliedConfigurations {
+				if slices.Contains(configs, config.Name) {
+					config.Status.AppliedTo = append(config.Status.AppliedTo, node)
+				}
+			}
+
+			slices.Sort(config.Status.AppliedTo)
+			matched := int64(len(config.Status.AppliedTo))
+			config.Status.Matched = &matched
+
 			return nil
 		})
 		if err != nil {
@@ -232,51 +274,46 @@ func (r *LinstorClusterReconciler) reconcileAppliedResource(ctx context.Context,
 	return nil
 }
 
-func (r *LinstorClusterReconciler) kustomizeResources(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, satelliteNodes []corev1.Node, configs []piraeusiov1.LinstorSatelliteConfiguration, existingSatellites []piraeusiov1.LinstorSatellite) (resmap.ResMap, error) {
+// kustomizeResources builds the resources to apply to the cluster.
+//
+// In addition to the resources to apply, it returns the list of LinstorSatelliteConfigurations applied to each Satellite.
+func (r *LinstorClusterReconciler) kustomizeResources(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, satelliteNodes []corev1.Node, configs []piraeusiov1.LinstorSatelliteConfiguration, existingSatellites []piraeusiov1.LinstorSatellite) (resmap.ResMap, map[string][]string, error) {
 	cfg, err := imageversions.FromConfigMap(ctx, r.Client, types.NamespacedName{Name: r.ImageConfigMapName, Namespace: r.Namespace})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	imgs, _ := cfg.GetVersions(lcluster.Spec.Repository, "")
 
-	ctrlRes, err := r.kustomizeControllerResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
-	csiControllerRes, err := r.kustomizeCSIControllerResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
-	csiNodeRes, err := r.kustomizeCSINodeResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
-	haControllerRes, err := r.kustomizeHAControllerResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
-	affinityControllerRes, err := r.kustomizeAffinityControllerResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
-	commonNodeRes, err := r.kustomizeNodeCommonResources(lcluster, imgs)
-	if err != nil {
-		return nil, err
-	}
-
 	resMap := resmap.New()
+
+	for _, f := range []func(*piraeusiov1.LinstorCluster, []kusttypes.Image) (resmap.ResMap, error){
+		r.kustomizeControllerResources,
+		r.kustomizeCSIControllerResources,
+		r.kustomizeCSINodeResources,
+		r.kustomizeHAControllerResources,
+		r.kustomizeAffinityControllerResources,
+		r.kustomizeNFSServerResources,
+		r.kustomizeNFSServiceResources,
+		r.kustomizeNodeCommonResources,
+	} {
+		r, err := f(lcluster, imgs)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if err := resMap.AppendAll(r); err != nil {
+			return nil, nil, err
+		}
+	}
 
 	sort.Slice(configs, func(i, j int) bool {
 		return configs[i].Name < configs[j].Name
 	})
 
 	satelliteTolerations := tolerations.MergeTolerations(tolerations.DefaultDaemonSetTolerations, tolerations.HAControllerTolerations, lcluster.Spec.Tolerations)
+
+	appliedConfigurations := make(map[string][]string)
 
 	for i := range satelliteNodes {
 		node := &satelliteNodes[i]
@@ -292,59 +329,31 @@ func (r *LinstorClusterReconciler) kustomizeResources(ctx context.Context, lclus
 		// Filter out satellites based on tolerations:
 		// * If there is a NoExecute taint we do not tolerate, do not configure a satellite.
 		// * If there is a NoSchedule taint we do not tolerate, configure a satellite only if one already exists.
-		_, untolerated := schedulingcorev1.FindMatchingUntoleratedTaint(node.Spec.Taints, satelliteTolerations, func(taint *corev1.Taint) bool {
+		_, untolerated := schedulingcorev1.FindMatchingUntoleratedTaint(r.log, node.Spec.Taints, satelliteTolerations, func(taint *corev1.Taint) bool {
 			if existingSatellite != nil {
 				return taint.Effect == corev1.TaintEffectNoExecute
 			} else {
 				return taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute
 			}
-		})
+		}, false)
 		if untolerated {
 			continue
 		}
 
-		satRes, err := r.kustomizeLinstorSatellite(ctx, lcluster, node, existingSatellite, configs, imgs)
+		satRes, matched, err := r.kustomizeLinstorSatellite(ctx, lcluster, node, existingSatellite, configs, imgs)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
 		err = resMap.AppendAll(satRes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+
+		appliedConfigurations[node.Name] = matched
 	}
 
-	err = resMap.AppendAll(ctrlRes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = resMap.AppendAll(csiControllerRes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = resMap.AppendAll(csiNodeRes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = resMap.AppendAll(haControllerRes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = resMap.AppendAll(affinityControllerRes)
-	if err != nil {
-		return nil, err
-	}
-
-	err = resMap.AppendAll(commonNodeRes)
-	if err != nil {
-		return nil, err
-	}
-
-	return resMap, nil
+	return resMap, appliedConfigurations, nil
 }
 
 // Create the LINSTOR Controller resources.
@@ -533,6 +542,24 @@ func (r *LinstorClusterReconciler) kustomizeCSIControllerResources(lcluster *pir
 
 			patches = append(patches, p...)
 		}
+	}
+
+	if !lcluster.Spec.NFSServer.IsEnabled() {
+		p, err := ClusterCSIControllerDisableRWXPatch()
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, p...)
+	}
+
+	if !r.SupportsVolumeGroupSnapshots {
+		p, err := ClusterCSIControllerDisableVolumeGroupSnapshotPatch()
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, p...)
 	}
 
 	if lcluster.Spec.CSIController.GetTemplate() != nil {
@@ -772,6 +799,108 @@ func (r *LinstorClusterReconciler) kustomizeAffinityControllerResources(lcluster
 	return r.kustomize(resourceDirs, lcluster, imgs, patches...)
 }
 
+// Create the NFS Server resources.
+//
+// Applies the following changes over the base resources:
+// * Namespace
+// * default labels
+// * default images
+// * pull secret (if any)
+// * restrict daemon set to cluster's node selector
+// * apply cluster tolerations
+// * user defined patches
+func (r *LinstorClusterReconciler) kustomizeNFSServerResources(lcluster *piraeusiov1.LinstorCluster, imgs []kusttypes.Image) (resmap.ResMap, error) {
+	if !lcluster.Spec.NFSServer.IsEnabled() {
+		return resmap.New(), nil
+	}
+
+	resourceDirs := []string{"nfs-server"}
+
+	patches, err := ClusterNFSServerNodeSelectorPatch(lcluster.Spec.NodeSelector)
+	if err != nil {
+		return nil, err
+	}
+
+	endpointPatches, err := ClusterApiEndpointPatch(LinstorControllerUrl(lcluster))
+	if err != nil {
+		return nil, err
+	}
+
+	patches = append(patches, endpointPatches...)
+
+	if lcluster.Spec.NodeAffinity != nil {
+		p, err := ClusterNFSServerNodeAffinityPatch(lcluster.Spec.NodeAffinity)
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, p...)
+	}
+
+	t := tolerations.MergeTolerations(tolerations.HAControllerTolerations, lcluster.Spec.Tolerations)
+	p, err := TolerationsPatch("DaemonSet", "linstor-csi-nfs-server", t)
+	if err != nil {
+		return nil, err
+	}
+
+	patches = append(patches, p...)
+
+	if lcluster.Spec.ApiTLS != nil {
+		nfsServerSecret := lcluster.Spec.ApiTLS.GetNFSServerSecretName()
+
+		p, err := ClusterNFSServerApiTLSPatch(nfsServerSecret, lcluster.Spec.ApiTLS.CAReference)
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, p...)
+
+		if lcluster.Spec.ApiTLS.CertManager != nil {
+			resourceDirs = append(resourceDirs, "nfs-server/cert-manager")
+
+			p, err := ClusterApiTLSClientCertManagerPatch("linstor-csi-nfs-server-tls", nfsServerSecret, lcluster.Spec.ApiTLS.CertManager)
+			if err != nil {
+				return nil, err
+			}
+
+			patches = append(patches, p...)
+		}
+	}
+
+	if lcluster.Spec.NFSServer.GetTemplate() != nil {
+		p, err := ComponentPodTemplate("DaemonSet", "linstor-csi-nfs-server", lcluster.Spec.NFSServer.GetTemplate())
+		if err != nil {
+			return nil, err
+		}
+
+		patches = append(patches, p...)
+	}
+
+	return r.kustomize(resourceDirs, lcluster, imgs, patches...)
+}
+
+// Create the NFS Service resource
+// Applies the following changes over the base resources:
+// * Namespace
+// * default labels, without applying them to selectors
+// * user defined patches
+func (r *LinstorClusterReconciler) kustomizeNFSServiceResources(lcluster *piraeusiov1.LinstorCluster, imgs []kusttypes.Image) (resmap.ResMap, error) {
+	if !lcluster.Spec.NFSServer.IsEnabled() {
+		return resmap.New(), nil
+	}
+
+	k := &kusttypes.Kustomization{
+		Namespace: r.Namespace,
+		// Disable inclusion in selectors: the Service is explicitly not using Selectors as DRBD Reactor is used to
+		// create the necessary EndpointSlices manually.
+		Labels:    r.kustomLabels(lcluster, false, false),
+		Resources: []string{"nfs-service"},
+		Patches:   utils.MakeKustPatches(lcluster.Spec.Patches...),
+	}
+
+	return r.Kustomizer.Kustomize(k)
+}
+
 // Create the common resources for LINSTOR satellites, but not the actual LinstorSatellite resources.
 //
 // The resources here are shared by all LinstorSatellite instances. This is used for:
@@ -796,7 +925,9 @@ func (r *LinstorClusterReconciler) kustomizeNodeCommonResources(lcluster *piraeu
 // * Set the cluster reference to the owning LinstorCluster
 // * Apply the result of merging all LinstorSatelliteConfigurations to the LinstorSatellite
 // * user defined patches
-func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, node *corev1.Node, existingSatellite *piraeusiov1.LinstorSatellite, configs []piraeusiov1.LinstorSatelliteConfiguration, imgs []kusttypes.Image) (resmap.ResMap, error) {
+//
+// In addition to the resources, it returns the names of the LinstorSatelliteConfigurations applied to the Satellite.
+func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, node *corev1.Node, existingSatellite *piraeusiov1.LinstorSatellite, configs []piraeusiov1.LinstorSatelliteConfiguration, imgs []kusttypes.Image) (resmap.ResMap, []string, error) {
 	renamePatch := utils.JsonPatch{
 		Op:    utils.Replace,
 		Path:  "/metadata/name",
@@ -842,10 +973,10 @@ func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context
 		})
 	}
 
-	t := tolerations.MergeTolerations(tolerations.HAControllerTolerations, lcluster.Spec.Tolerations)
+	t := tolerations.MergeTolerations(tolerations.HAControllerTolerations, tolerations.NoScheduleToleration, lcluster.Spec.Tolerations)
 	tolerationsPatches, err := TolerationsPatch("DaemonSet", "linstor-satellite", t)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, p := range tolerationsPatches {
@@ -856,7 +987,13 @@ func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context
 		})
 	}
 
-	cfg := merge.SatelliteConfigurations(ctx, node, configs...)
+	cfg, matched := merge.SatelliteConfigurations(ctx, node, configs...)
+
+	patches = append(patches, utils.JsonPatch{
+		Op:    utils.Add,
+		Path:  "/metadata/annotations/" + jsonpointer.Escape(vars.AppliedConfigurationAnnotation),
+		Value: strings.Join(matched, ","),
+	})
 
 	if cfg.Spec.InternalTLS != nil {
 		patches = append(patches, utils.JsonPatch{
@@ -879,6 +1016,14 @@ func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context
 			Op:    utils.Add,
 			Path:  "/spec/deletionPolicy",
 			Value: cfg.Spec.DeletionPolicy,
+		})
+	}
+
+	if cfg.Spec.EvacuationStrategy != nil {
+		patches = append(patches, utils.JsonPatch{
+			Op:    utils.Add,
+			Path:  "/spec/evacuationStrategy",
+			Value: cfg.Spec.EvacuationStrategy,
 		})
 	}
 
@@ -911,10 +1056,11 @@ func (r *LinstorClusterReconciler) kustomizeLinstorSatellite(ctx context.Context
 		patches,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return r.kustomize([]string{"satellite"}, lcluster, imgs, *patch)
+	res, err := r.kustomize([]string{"satellite"}, lcluster, imgs, *patch)
+	return res, matched, err
 }
 
 // kustomize applies the common Kustomizations along with the given patches.
@@ -926,7 +1072,7 @@ func (r *LinstorClusterReconciler) kustomize(resources []string, lcluster *pirae
 
 	k := &kusttypes.Kustomization{
 		Namespace: r.Namespace,
-		Labels:    r.kustomLabels(lcluster),
+		Labels:    r.kustomLabels(lcluster, true, true),
 		Resources: resources,
 		Images:    imgs,
 		Patches:   append(append(patches, saPatch...), utils.MakeKustPatches(lcluster.Spec.Patches...)...),
@@ -943,15 +1089,15 @@ func (r *LinstorClusterReconciler) pullSecretPatch() ([]kusttypes.Patch, error) 
 	return PullSecretPatch(r.PullSecret)
 }
 
-func (r *LinstorClusterReconciler) kustomLabels(lcluster *piraeusiov1.LinstorCluster) []kusttypes.Label {
+func (r *LinstorClusterReconciler) kustomLabels(lcluster *piraeusiov1.LinstorCluster, includeSelectors, includeTemplate bool) []kusttypes.Label {
 	return []kusttypes.Label{
 		{
 			Pairs: map[string]string{
 				"app.kubernetes.io/name":     vars.ProjectName,
 				"app.kubernetes.io/instance": lcluster.Name,
 			},
-			IncludeSelectors: true,
-			IncludeTemplates: true,
+			IncludeSelectors: includeSelectors,
+			IncludeTemplates: includeTemplate,
 		},
 		{
 			Pairs: vars.ExtraLabels,
@@ -959,9 +1105,11 @@ func (r *LinstorClusterReconciler) kustomLabels(lcluster *piraeusiov1.LinstorClu
 	}
 }
 
-func (r *LinstorClusterReconciler) reconcileClusterState(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, conds conditions.Conditions) error {
+func (r *LinstorClusterReconciler) reconcileClusterState(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, conds conditions.Conditions) (piraeusiov1.LinstorClusterStatus, error) {
 	var caRef *piraeusiov1.CAReference
 	var clientSecret string
+	var status piraeusiov1.LinstorClusterStatus
+
 	if lcluster.Spec.ApiTLS != nil {
 		caRef = lcluster.Spec.ApiTLS.CAReference
 		clientSecret = lcluster.Spec.ApiTLS.GetClientSecretName()
@@ -982,7 +1130,7 @@ func (r *LinstorClusterReconciler) reconcileClusterState(ctx context.Context, lc
 	if err != nil || lc == nil {
 		conds.AddError(conditions.Available, err)
 		conds.AddUnknown(conditions.Configured, "Controller unreachable")
-		return err
+		return status, err
 	}
 
 	connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -991,15 +1139,16 @@ func (r *LinstorClusterReconciler) reconcileClusterState(ctx context.Context, lc
 	if err != nil {
 		conds.AddError(conditions.Available, err)
 		conds.AddUnknown(conditions.Configured, "Controller unreachable")
-		return err
+		return status, err
 	}
 
+	status.Version = version.Version
 	conds.AddSuccess(conditions.Available, fmt.Sprintf("Controller %s (API: %s, Git: %s) reachable at '%s'", version.Version, version.RestApiVersion, version.GitHash, lc.BaseURL()))
 
 	current, err := lc.Controller.GetProps(ctx)
 	if err != nil {
 		conds.AddError(conditions.Configured, err)
-		return err
+		return status, err
 	}
 
 	expectedProperties := utils.ResolveClusterProperties(vars.DefaultControllerProperties, lcluster.Spec.Properties...)
@@ -1010,13 +1159,87 @@ func (r *LinstorClusterReconciler) reconcileClusterState(ctx context.Context, lc
 		err = lc.Controller.Modify(ctx, *modification)
 		if err != nil {
 			conds.AddError(conditions.Configured, err)
-			return err
+			return status, err
 		}
 	}
 
 	conds.AddSuccess(conditions.Configured, "Properties applied")
 
-	return r.reconcileCSINodes(ctx, lcluster, lc, conds)
+	err = r.getClusterStatus(ctx, lcluster, lc, &status)
+	if err != nil {
+		conds.AddError(conditions.Configured, err)
+		return status, err
+	}
+
+	return status, r.reconcileCSINodes(ctx, lcluster, lc, conds)
+}
+
+func (r *LinstorClusterReconciler) getClusterStatus(ctx context.Context, lcluster *piraeusiov1.LinstorCluster, lc *linstorhelper.Client, status *piraeusiov1.LinstorClusterStatus) error {
+	var satelliteList piraeusiov1.LinstorSatelliteList
+	err := r.Client.List(ctx, &satelliteList, client.MatchingLabels{
+		"app.kubernetes.io/instance": lcluster.Name,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to fetch LinstorSatellites: %w", err)
+	}
+
+	var scheduled, running int32
+	for _, satellite := range satelliteList.Items {
+		if satellite.DeletionTimestamp == nil {
+			scheduled++
+		}
+
+		cond := meta.FindStatusCondition(satellite.Status.Conditions, string(conditions.Available))
+		if cond != nil && cond.Status == metav1.ConditionTrue {
+			running++
+		}
+	}
+
+	status.ScheduledSatellites = &scheduled
+	status.RunningSatellites = &running
+
+	sp, err := lc.Nodes.GetStoragePoolView(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch storage pools: %w", err)
+	}
+
+	var total, free int64
+	for _, pool := range sp {
+		if pool.TotalCapacity == math.MaxInt64 {
+			// Skip all the "diskless" pools, they always report max capacity
+			continue
+		}
+
+		// LINSTOR reports KiB
+		total += pool.TotalCapacity * 1024
+		free += pool.FreeCapacity * 1024
+	}
+
+	status.TotalCapacityBytes = &total
+	status.FreeCapacityBytes = &free
+
+	rds, err := lc.ResourceDefinitions.GetAll(ctx, lapi.RDGetAllRequest{WithVolumeDefinitions: true})
+	if err != nil {
+		return fmt.Errorf("failed to fetch resource definitions: %w", err)
+	}
+
+	var vols int32
+	for _, rd := range rds {
+		if len(rd.VolumeDefinitions) > 0 {
+			// Only count RDs with volume definitions, others are "snapshot-only" RDs
+			vols++
+		}
+	}
+	status.NumberOfVolumes = &vols
+
+	snapshots, err := lc.Resources.GetSnapshotView(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to fetch snapshot views: %w", err)
+	}
+
+	status.NumberOfSnapshots = ptr.To(int32(len(snapshots)))
+
+	return nil
 }
 
 // reconcileCSINodes ensures that the CSINode resources are up-to-date.
@@ -1148,7 +1371,15 @@ func (r *LinstorClusterReconciler) SetupWithManager(mgr ctrl.Manager, opts contr
 		opts.RateLimiter = DefaultRateLimiter[reconcile.Request]()
 	}
 
-	r.APIVersion = utils.NewAPIVersionFromConfigWithFallback(mgr.GetConfig(), &vars.FallbackAPIVersion)
+	apiDiscovery := utils.NewAPIDiscoveryClient(mgr.GetConfig(), &vars.FallbackAPIVersion)
+	r.APIVersion = apiDiscovery.ServerVersion()
+	r.SupportsVolumeGroupSnapshots = apiDiscovery.HasGroupVersionResource(schema.GroupVersionResource{
+		Group:    "groupsnapshot.storage.k8s.io",
+		Version:  "v1beta2",
+		Resource: "volumegroupsnapshots",
+	})
+
+	r.log = mgr.GetLogger().WithName("LinstorClusterReconciler")
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&piraeusiov1.LinstorCluster{}).

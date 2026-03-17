@@ -7,13 +7,119 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v2.10.5] - 2026-03-10
+
+### Added
+
+- Image configuration for Debian Trixie
+
+### Fixed
+
+- Updated NFS server template to work with NFS Ganesha instances with monitoring enabled.
+- Ensure Satellites are always rescheduled on NoScheduled nodes as long as the LinstorSatellite resource exists.
+
+### Changed
+
+- Updated images:
+    * LINSTOR 1.33.1
+    * LINSTOR CSI 1.10.6
+    * DRBD 9.3.1
+    * DRBD Reactor 1.11.0
+    * Latest CSI sidecars
+
+## [v2.10.4] - 2026-01-13
+
+### Fixed
+
+- Name collision for CSI Node container ports
+- Do not block evacuation on other satellites being evacuated.
+
+### Changed
+
+- Updated images:
+    * LINSTOR CSI 1.10.5
+
+## [v2.10.3] - 2025-12-05
+
+### Fixed
+
+- Update RBAC for `csi-resizer` sidecar.
+
+### Changed
+
+- Updated images:
+    * LINSTOR CSI 1.10.4
+    * HA Controller 1.3.2
+    * DRBD Shutdown Guard 1.1.2
+
+## [v2.10.2] - 2025-11-26
+
+### Added
+
+- Configurable timeouts for how long the Operator waits for volume to (re-)attach during evacuation.
+
+### Fixed
+
+- Ensure `mount` commands pass along SELinux options by mounting SELinux directories.
+
+## [v2.10.1] - 2025-11-12
+
+### Added
+
+- Liveness probes for CSI sidecars
+
+### Changed
+
+- Disable group snapshots if we cannot be sure they are supported, otherwise the csi-snapshot silently breaks.
+
+### Fixed
+
+- Status update on LinstorCluster and LinstorSatellite resources no longer causes infinite reconciles.
+
+## [v2.10.0] - 2025-11-05
+
 ### Added
 
 - Deploy [LINSTOR Affinity Controller] as part of Piraeus Datastore.
 - Add option to set replica count for Deployment components.
 - Integration with ClusterAPI to enable graceful node evacuation in case of rolling machine updates.
+- Additional status information on `LinstorCluster`, `LinstorSatelliteConfiguration` and `LinstorSatellite` resources.
+- Sign container images using keyless [cosign] signatures
+- Support for [Volume Group Snapshots](https://kubernetes.io/blog/2025/09/16/kubernetes-v1-34-volume-group-snapshot-beta-2/)
+- Support for RWX filesystems using regular LINSTOR CSI volumes.
 
 [LINSTOR Affinity Controller]: https://github.com/piraeusdatastore/linstor-affinity-controller
+[cosign]: https://docs.sigstore.dev/quickstart/quickstart-cosign/
+
+### Changed
+
+- Set `shareProcessNamespace: true` on workloads to automatically reap orphaned processes.
+- LINSTOR CSI now use `hostNetwork: true` so RWX mounts use a stable IP when connecting to NFS.
+- Updated images:
+    * LINSTOR 1.32.3
+    * LINSTOR CSI 1.10.1
+    * DRBD Reactor 1.10.0
+    * DRBD Shutdown Guard: 1.1.1
+    * LINSTOR HA Controller 1.3.1
+    * Latest CSI sidecars
+
+## [v2.9.1] - 2025-09-25
+
+### Changed
+
+- Image configuration for RHEL10 clones.
+- Do not remove existing satellites for `*NoSchedule` taints.
+- Updated images:
+    * LINSTOR 1.32.1
+    * LINSTOR CSI 1.9.0
+    * DRBD 9.2.15
+    * DRBD Reactor 1.9.0
+    * kTLS-utils 1.2.1
+    * Latest CSI sidecars
+
+### Fixed
+
+- Fix a crash in the validation webhook when trying to change the type of storage pool.
 
 ### Removed
 
@@ -22,15 +128,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Ubuntu 20.04 ("Focal Fossa")
   * CentOS 7
   * Debian 10 ("Buster")
-
-### Changed
-
-- Image configuration for RHEL10 clones.
-- Do not remove existing satellites for `*NoSchedule` taints.
-
-### Fixed
-
-- Fix a crash in the validation webhook when trying to change the type of storage pool.
 
 ## [v2.9.0] - 2025-06-17
 
@@ -1064,4 +1161,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [v2.8.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.7.1...v2.8.0
 [v2.8.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.8.0...v2.8.1
 [v2.9.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.8.1...v2.9.0
-[Unreleased]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.9.0...HEAD
+[v2.9.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.9.0...v2.9.1
+[v2.10.0]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.9.1...v2.10.0
+[v2.10.1]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.0...v2.10.1
+[v2.10.2]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.1...v2.10.2
+[v2.10.3]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.2...v2.10.3
+[v2.10.4]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.3...v2.10.4
+[v2.10.5]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.4...v2.10.5
+[Unreleased]: https://github.com/piraeusdatastore/piraeus-operator/compare/v2.10.5...HEAD

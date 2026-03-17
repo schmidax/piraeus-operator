@@ -12,12 +12,12 @@ jobs:
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v5
-    - uses: actions/setup-python@v5
+    - uses: actions/checkout@v6
+    - uses: actions/setup-python@v6
       with:
         python-version: 3.x
     - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
-    - uses: actions/cache@v4
+    - uses: actions/cache@v5
       with:
         key: mkdocs-material-${{ env.cache_id }}
         path: .cache
@@ -32,10 +32,10 @@ jobs:
     permissions:
       contents: write
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v6
       with:
         fetch-depth: '0'
-    - uses: webfactory/ssh-agent@v0.9.1
+    - uses: webfactory/ssh-agent@v0.10.0
       with:
         ssh-private-key: ${{ secrets.GH_PAGES_REPO_KEY }}
     - name: Configure Git
@@ -45,11 +45,11 @@ jobs:
         # Deployed docs are in another repo for nice URLs
         git remote add gh-pages git@github.com:piraeusdatastore/docs.git
         git fetch gh-pages gh-pages --depth=1
-    - uses: actions/setup-python@v5
+    - uses: actions/setup-python@v6
       with:
         python-version: 3.x
     - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
-    - uses: actions/cache@v4
+    - uses: actions/cache@v5
       with:
         key: mkdocs-material-${{ env.cache_id }}
         path: .cache

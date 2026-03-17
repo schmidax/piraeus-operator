@@ -4,7 +4,7 @@ PROJECT_NAME ?= piraeus-operator
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
-VERSION ?= 2.9.0
+VERSION ?= 2.10.5
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -133,7 +133,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # (i.e. docker build --platform linux/arm64 ). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-docker-build: test ## Build docker image with the manager.
+docker-build: ## Build docker image with the manager.
 	docker buildx build --platform ${PLATFORM} --build-arg=VERSION=$(shell git describe --tags --match "v*.*" --dirty) -t ${IMG} .
 
 .PHONY: docker-push
@@ -287,4 +287,10 @@ manifest.yaml: $(KUSTOMIZE)
 
 .PHONY: changes.md
 changes.md:
-	hack/extract-changelog.sh v$(VERSION) > $@
+	tools/extract-changelog.sh v$(VERSION) > $@
+
+chart: piraeus-$(VERSION).tar.gz
+
+.PHONY: piraeus-$(VERSION).tar.gz
+piraeus-$(VERSION).tar.gz:
+	helm package charts/piraeus

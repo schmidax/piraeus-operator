@@ -113,6 +113,10 @@ type LinstorClusterSpec struct {
 	// AffinityController controls the deployment of the Affinity Controller Deployment.
 	// +kubebuilder:validation:Optional
 	AffinityController *DeploymentComponentSpec `json:"affinityController,omitempty"`
+
+	// NFSServer controls the deployment of the LINSTOR CSI NFS Server DaemonSet.
+	// +kubebuilder:validation:Optional
+	NFSServer *ComponentSpec `json:"nfsServer,omitempty"`
 }
 
 type LinstorExternalControllerRef struct {
@@ -142,10 +146,15 @@ type LinstorClusterApiTLS struct {
 	//+kubebuilder:validation:Optional
 	CsiNodeSecretName string `json:"csiNodeSecretName,omitempty"`
 
-	// AffinityControllerSecretName references a secret holding the TLS key and certificate used by the CSI Controller
-	// to provision volumes. Defaults to "linstor-affinity-controller-tls".
+	// AffinityControllerSecretName references a secret holding the TLS key and certificate used by the Affinity
+	// Controller to monitor volume state. Defaults to "linstor-affinity-controller-tls".
 	//+kubebuilder:validation:Optional
 	AffinityControllerSecretName string `json:"affinityControllerSecretName,omitempty"`
+
+	// NFSServerSecretName references a secret holding the TLS key and certificate used by the NFS Server to query
+	// the cluster state. Defaults to "linstor-csi-nfs-server-tls".
+	//+kubebuilder:validation:Optional
+	NFSServerSecretName string `json:"nfsServerSecretName,omitempty"`
 
 	// CertManager references a cert-manager Issuer or ClusterIssuer.
 	// If set, cert-manager.io/Certificate resources will be created, provisioning the secrets referenced in
@@ -199,6 +208,14 @@ func (l *LinstorClusterApiTLS) GetAffinityControllerSecretName() string {
 	return l.AffinityControllerSecretName
 }
 
+func (l *LinstorClusterApiTLS) GetNFSServerSecretName() string {
+	if l.NFSServerSecretName == "" {
+		return "linstor-csi-nfs-server-tls"
+	}
+
+	return l.NFSServerSecretName
+}
+
 // LinstorClusterStatus defines the observed state of LinstorCluster
 type LinstorClusterStatus struct {
 	// Current LINSTOR Cluster state
@@ -206,12 +223,56 @@ type LinstorClusterStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
+
+	// The Version of the LINSTOR Cluster.
+	//+kubebuilder:validation:Optional
+	Version string `json:"version,omitempty"`
+
+	// The number of LINSTOR Satellites that are expected to run.
+	//+kubebuilder:validation:Optional
+	ScheduledSatellites *int32 `json:"scheduledSatellites"`
+
+	// The number of LINSTOR Satellites currently running.
+	//+kubebuilder:validation:Optional
+	RunningSatellites *int32 `json:"runningSatellites"`
+
+	// The number of volumes in the LINSTOR Cluster.
+	//+kubebuilder:validation:Optional
+	NumberOfVolumes *int32 `json:"numberOfVolumes"`
+
+	// The number of snapshots in the LINSTOR Cluster.
+	//+kubebuilder:validation:Optional
+	NumberOfSnapshots *int32 `json:"numberOfSnapshots"`
+
+	// The number of bytes in total in all storage pools in the LINSTOR Cluster.
+	//+kubebuilder:validation:Optional
+	TotalCapacityBytes *int64 `json:"availableCapacityBytes"`
+
+	// The number of bytes free in all storage pools in the LINSTOR Cluster.
+	//+kubebuilder:validation:Optional
+	FreeCapacityBytes *int64 `json:"freeCapacityBytes"`
+
+	// Satellites mirrors the information from ScheduledSatellites and RunningSatellites in a human-readable string
+	//+kubebuilder:validation:Optional
+	Satellites string `json:"satellites"`
+
+	// Capacity mirrors the information from TotalCapacityBytes and FreeCapacityBytes in a human-readable string
+	//+kubebuilder:validation:Optional
+	Capacity string `json:"capacity"`
 }
 
 // LinstorCluster is the Schema for the linstorclusters API
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Available",type=string,JSONPath=`.status.conditions[?(@.type=='Available')].status`,description="If the LINSTOR Cluster is available"
+// +kubebuilder:printcolumn:name="Configured",type=string,JSONPath=`.status.conditions[?(@.type=='Configured')].status`,description="If the LINSTOR Cluster is fully configured"
+// +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.status.version`,description="The version of the LINSTOR Cluster",priority=10
+// +kubebuilder:printcolumn:name="Satellites",type=string,JSONPath=`.status.satellites`,description="The number of running/expected Satellites"
+// +kubebuilder:printcolumn:name="Used Capacity",type=string,JSONPath=`.status.capacity`,description="The used capacity in all storage pools"
+// +kubebuilder:printcolumn:name="Volumes",type=integer,JSONPath=`.status.numberOfVolumes`,description="The number of volumes in the cluster"
+// +kubebuilder:printcolumn:name="Snapshots",type=integer,JSONPath=`.status.numberOfSnapshots`,description="The number of snapshots in the cluster",priority=10
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 type LinstorCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

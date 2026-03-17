@@ -106,6 +106,14 @@ rules:
   - get
   - update
 - apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  - endpointslices/restricted
+  verbs:
+  - create
+  - delete
+- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -116,6 +124,32 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - groupsnapshot.storage.k8s.io
+  resources:
+  - volumegroupsnapshotclasses
+  - volumesnapshots
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - groupsnapshot.storage.k8s.io
+  resources:
+  - volumegroupsnapshotcontents
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - groupsnapshot.storage.k8s.io
+  resources:
+  - volumegroupsnapshotcontents/status
+  verbs:
+  - patch
+  - update
 - apiGroups:
   - internal.linstor.linbit.com
   resources:
@@ -207,7 +241,6 @@ rules:
   resources:
   - volumesnapshotcontents
   verbs:
-  - delete
   - get
   - list
   - patch
@@ -246,6 +279,7 @@ rules:
   - storage.k8s.io
   resources:
   - storageclasses
+  - volumeattributesclasses
   verbs:
   - get
   - list

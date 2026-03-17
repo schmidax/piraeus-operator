@@ -9,30 +9,30 @@ on:
   pull_request:
 jobs:
   golangci:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
-      - uses: golangci/golangci-lint-action@v8
+          go-version-file: 'go.mod'
+      - uses: golangci/golangci-lint-action@v9
         with:
           args: --timeout=3m
 
   pre-commit:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     env:
       # These hooks will run separately in github actions
       SKIP: golangci-lint,check-docs
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Setup Go environment
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
-      - uses: actions/setup-python@v5
+          go-version-file: 'go.mod'
+      - uses: actions/setup-python@v6
       - name: Cache envtest assets
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           key: envtest-base
           path: |
@@ -40,14 +40,14 @@ jobs:
       - name: Run pre-commit checks on changes files
         uses: pre-commit/action@v3.0.1
   compat-tests:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.24'
+          go-version-file: 'go.mod'
       - name: Cache envtest assets
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           key: envtest-compat
           path: |

@@ -2,6 +2,7 @@ package controller_test
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -14,6 +15,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	piraeusiov1 "github.com/piraeusdatastore/piraeus-operator/v2/api/v1"
 	"github.com/piraeusdatastore/piraeus-operator/v2/pkg/conditions"
@@ -158,6 +160,10 @@ var _ = Describe("LinstorCluster controller", func() {
 							{Target: &piraeusiov1.Selector{Kind: "ServiceAccount"}, Patch: "sa-patch1"},
 						},
 						InternalTLS: &piraeusiov1.TLSConfigWithHandshakeDaemon{},
+						EvacuationStrategy: &piraeusiov1.EvacuationStrategy{
+							AttachedVolumeReattachTimeout: metav1.Duration{Duration: 1 * time.Minute},
+							UnattachedVolumeAttachTimeout: metav1.Duration{Duration: 2 * time.Minute},
+						},
 					},
 				})
 				Expect(err).NotTo(HaveOccurred())
@@ -231,6 +237,10 @@ var _ = Describe("LinstorCluster controller", func() {
 					},
 					InternalTLS:    &piraeusiov1.TLSConfigWithHandshakeDaemon{},
 					DeletionPolicy: piraeusiov1.DeletionPolicyEvacuate,
+					EvacuationStrategy: piraeusiov1.EvacuationStrategy{
+						AttachedVolumeReattachTimeout: metav1.Duration{Duration: 1 * time.Minute},
+						UnattachedVolumeAttachTimeout: metav1.Duration{Duration: 2 * time.Minute},
+					},
 				}
 
 				specZoneB := &piraeusiov1.LinstorSatelliteSpec{
@@ -248,6 +258,10 @@ var _ = Describe("LinstorCluster controller", func() {
 					},
 					InternalTLS:    &piraeusiov1.TLSConfigWithHandshakeDaemon{},
 					DeletionPolicy: piraeusiov1.DeletionPolicyRetain,
+					EvacuationStrategy: piraeusiov1.EvacuationStrategy{
+						AttachedVolumeReattachTimeout: metav1.Duration{Duration: 1 * time.Minute},
+						UnattachedVolumeAttachTimeout: metav1.Duration{Duration: 2 * time.Minute},
+					},
 				}
 
 				// The first patch is always for tolerations. We ignore this here, as this is not related to
@@ -313,27 +327,30 @@ var _ = Describe("LinstorCluster controller", func() {
 					return satellites.Items
 				}).Should(HaveLen(3))
 
-				var cluster piraeusiov1.LinstorCluster
-				err := k8sClient.Get(ctx, types.NamespacedName{Name: "default"}, &cluster)
-				Expect(err).NotTo(HaveOccurred())
-
-				cluster.Spec.NodeAffinity = &corev1.NodeSelector{
-					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
-						MatchExpressions: []corev1.NodeSelectorRequirement{
-							{
-								Key:      "topology.kubernetes.io/zone",
-								Operator: corev1.NodeSelectorOpNotIn,
-								Values:   []string{"b"},
-							},
-							{
-								Key:      "example.com/exclude",
-								Operator: corev1.NodeSelectorOpDoesNotExist,
-							},
+				cluster := piraeusiov1.LinstorCluster{
+					ObjectMeta: metav1.ObjectMeta{Name: "default"},
+					Spec: piraeusiov1.LinstorClusterSpec{
+						NodeAffinity: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+								MatchExpressions: []corev1.NodeSelectorRequirement{
+									{
+										Key:      "topology.kubernetes.io/zone",
+										Operator: corev1.NodeSelectorOpNotIn,
+										Values:   []string{"b"},
+									},
+									{
+										Key:      "example.com/exclude",
+										Operator: corev1.NodeSelectorOpDoesNotExist,
+									},
+								},
+							}},
 						},
-					}},
+					},
 				}
 
-				err = k8sClient.Update(ctx, &cluster)
+				err := k8sClient.Patch(ctx, &cluster, client.MergeFrom(&piraeusiov1.LinstorCluster{
+					ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				}))
 				Expect(err).NotTo(HaveOccurred())
 
 				Eventually(func() []string {
@@ -386,17 +403,20 @@ var _ = Describe("LinstorCluster controller", func() {
 				))
 
 				// Update the LinstorCluster to tolerate an additional taint
-				var cluster piraeusiov1.LinstorCluster
-				err = k8sClient.Get(ctx, types.NamespacedName{Name: "default"}, &cluster)
-				Expect(err).NotTo(HaveOccurred())
+				Eventually(func() error {
+					var cluster piraeusiov1.LinstorCluster
+					err = k8sClient.Get(ctx, types.NamespacedName{Name: "default"}, &cluster)
+					if err != nil {
+						return err
+					}
 
-				cluster.Spec.Tolerations = append(cluster.Spec.Tolerations, corev1.Toleration{
-					Key:      "example.com/manual-taint",
-					Operator: corev1.TolerationOpExists,
-					Effect:   corev1.TaintEffectNoExecute,
-				})
-				err = k8sClient.Update(ctx, &cluster)
-				Expect(err).NotTo(HaveOccurred())
+					cluster.Spec.Tolerations = append(cluster.Spec.Tolerations, corev1.Toleration{
+						Key:      "example.com/manual-taint",
+						Operator: corev1.TolerationOpExists,
+						Effect:   corev1.TaintEffectNoExecute,
+					})
+					return k8sClient.Update(ctx, &cluster)
+				}).Should(Succeed())
 
 				Eventually(func() appsv1.DaemonSet {
 					var csiNodes appsv1.DaemonSet
@@ -440,16 +460,38 @@ var _ = Describe("LinstorCluster controller", func() {
 					))),
 				))
 
-				// The Satellites, CSI nodes, and HA Controller should have a patch updating their tolerations
+				// The CSI nodes, and HA Controller should have a patch updating their tolerations.
 				Eventually(func() []appsv1.DaemonSet {
 					var daemonSets appsv1.DaemonSetList
 					err := k8sClient.List(ctx, &daemonSets)
 					Expect(err).NotTo(HaveOccurred())
-					return daemonSets.Items
+					return slices.DeleteFunc(daemonSets.Items, func(ds appsv1.DaemonSet) bool {
+						return ds.GetLabels()["app.kubernetes.io/component"] == "linstor-satellite"
+					})
 				}).Should(And(
-					HaveLen(4), // 2 Satellites DS, 1 CSI Node, 1 HA Controller.
+					HaveLen(3), // 1 CSI Node, 1 HA Controller, 1 NFS Server.
 					HaveEach(HaveField("Spec.Template.Spec.Tolerations", ConsistOf(
 						append(slices.Clone(tolerations.HAControllerTolerations),
+							corev1.Toleration{
+								Key:      "example.com/manual-taint",
+								Operator: corev1.TolerationOpExists,
+								Effect:   corev1.TaintEffectNoExecute,
+							})),
+					)),
+				))
+
+				// The Satellites should also have been patched updating the tolerations.
+				Eventually(func() []appsv1.DaemonSet {
+					var daemonSets appsv1.DaemonSetList
+					err := k8sClient.List(ctx, &daemonSets)
+					Expect(err).NotTo(HaveOccurred())
+					return slices.DeleteFunc(daemonSets.Items, func(ds appsv1.DaemonSet) bool {
+						return ds.GetLabels()["app.kubernetes.io/component"] != "linstor-satellite"
+					})
+				}).Should(And(
+					HaveLen(2), // 2 Satellites.
+					HaveEach(HaveField("Spec.Template.Spec.Tolerations", ConsistOf(
+						append(append(slices.Clone(tolerations.HAControllerTolerations), slices.Clone(tolerations.NoScheduleToleration)...),
 							corev1.Toleration{
 								Key:      "example.com/manual-taint",
 								Operator: corev1.TolerationOpExists,
@@ -604,6 +646,7 @@ var _ = Describe("LinstorCluster controller", func() {
 					ClientSecretName:             "my-client-tls",
 					CsiControllerSecretName:      "my-csi-controller-tls",
 					CsiNodeSecretName:            "my-csi-node-tls",
+					NFSServerSecretName:          "my-nfs-server-tls",
 					AffinityControllerSecretName: "my-affinity-controller-tls",
 				},
 			},
@@ -678,6 +721,15 @@ var _ = Describe("LinstorCluster controller", func() {
 
 			linstorCsi := GetContainer(affinityControllerDeployment.Spec.Template.Spec.Containers, "linstor-affinity-controller")
 			envCheck(g, linstorCsi, "my-affinity-controller-tls")
+		}).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			var csiNodeDaemonSet appsv1.DaemonSet
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: "linstor-csi-nfs-server", Namespace: Namespace}, &csiNodeDaemonSet)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			linstorWaitNodeOnline := GetContainer(csiNodeDaemonSet.Spec.Template.Spec.InitContainers, "linstor-wait-node-online")
+			envCheck(g, linstorWaitNodeOnline, "my-nfs-server-tls")
 		}).Should(Succeed())
 	})
 })

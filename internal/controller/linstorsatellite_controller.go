@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"time"
 
@@ -32,9 +33,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,6 +76,7 @@ type LinstorSatelliteReconciler struct {
 	LinstorClientOpts  []lapi.Option
 	Kustomizer         *resources.Kustomizer
 	log                logr.Logger
+	recorder           record.EventRecorder
 }
 
 //+kubebuilder:rbac:groups=piraeus.io,resources=linstorsatellites,verbs=get;list;watch;create;update;patch;delete
@@ -117,6 +121,7 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		}
 	}
 
+	var status piraeusiov1.LinstorSatelliteStatus
 	var deleteErr, stateErr error
 	if lsatellite.GetDeletionTimestamp() != nil {
 		msg, done, err := r.deleteSatellite(ctx, lsatellite, &node, conds)
@@ -133,13 +138,30 @@ func (r *LinstorSatelliteReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			deleteErr = r.Client.Update(ctx, lsatellite)
 		}
 
-		stateErr = r.reconcileLinstorSatelliteState(ctx, lsatellite, &node, conds)
+		stateErr = r.reconcileLinstorSatelliteState(ctx, lsatellite, &node, conds, &status)
 	}
 
 	_, condErr := controllerutil.CreateOrPatch(ctx, r.Client, lsatellite, func() error {
+		// Fill in existing conditions so meta.SetStatusCondition does not update the LastTransitionTime if the
+		// condition is already set.
+		status.Conditions = lsatellite.Status.Conditions
+
 		for _, cond := range conds.ToConditions(lsatellite.Generation) {
-			meta.SetStatusCondition(&lsatellite.Status.Conditions, cond)
+			meta.SetStatusCondition(&status.Conditions, cond)
 		}
+
+		status.DeepCopyInto(&lsatellite.Status)
+
+		if status.FreeCapacityBytes != nil && status.TotalCapacityBytes != nil {
+			// Report used/total capacity. Assume "used" is total - free. Always report in GiB.
+			lsatellite.Status.Capacity = fmt.Sprintf("%d/%dGiB",
+				resource.NewQuantity(*status.TotalCapacityBytes-*status.FreeCapacityBytes, resource.BinarySI).ScaledValue(resource.Giga),
+				resource.NewQuantity(*status.TotalCapacityBytes, resource.BinarySI).ScaledValue(resource.Giga),
+			)
+		}
+
+		slices.Sort(lsatellite.Status.StorageProviders)
+		slices.Sort(lsatellite.Status.DeviceLayers)
 
 		return nil
 	})
@@ -316,7 +338,7 @@ func (r *LinstorSatelliteReconciler) kustomizeNodeResources(ctx context.Context,
 	return r.Kustomizer.Kustomize(k)
 }
 
-func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite, node *corev1.Node, conds conditions.Conditions) error {
+func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.Context, lsatellite *piraeusiov1.LinstorSatellite, node *corev1.Node, conds conditions.Conditions, status *piraeusiov1.LinstorSatelliteStatus) error {
 	// machine might be nil if
 	// * the MachineClient is nil (integration disabled)
 	// * the cluster is not using ClusterAPI
@@ -338,8 +360,8 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 		}
 	} else {
 		err = errors.Join(
-			r.MachineClient.AllowMachineDrain(ctx, machine),
-			r.MachineClient.AllowMachineTermination(ctx, machine),
+			r.MachineClient.AllowMachineDrain(ctx, r.recorder, machine),
+			r.MachineClient.AllowMachineTermination(ctx, r.recorder, machine),
 		)
 		if err != nil {
 			conds.AddError(conditions.Available, err)
@@ -438,7 +460,7 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 	}
 
 	if lnode.ConnectionStatus == "ONLINE" {
-		conds.AddSuccess(conditions.Available, "satellite online")
+		conds.AddSuccess(conditions.Available, lnode.ConnectionStatus)
 
 		err := r.reconcileStoragePools(ctx, lc, lsatellite, node)
 		if err != nil {
@@ -447,9 +469,48 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 			conds.AddSuccess(conditions.Configured, "Pools configured")
 		}
 
+		// Add additional status information
+		sp, err := lc.Nodes.GetStoragePools(ctx, node.Name)
+		if err == nil {
+			var total, free int64
+			for _, pool := range sp {
+				if pool.TotalCapacity == math.MaxInt64 {
+					// Skip all the "diskless" pools, they always report max capacity
+					continue
+				}
+
+				// LINSTOR reports KiB
+				total += pool.TotalCapacity * 1024
+				free += pool.FreeCapacity * 1024
+			}
+
+			status.TotalCapacityBytes = &total
+			status.FreeCapacityBytes = &free
+		}
+
+		rs, err := lc.Resources.GetResourceView(ctx, &lapi.ListOpts{Node: []string{node.Name}})
+		if err == nil {
+			n := int32(len(rs))
+			status.NumberOfVolumes = &n
+		}
+
+		snaps, err := lc.Resources.GetSnapshotView(ctx, &lapi.ListOpts{Node: []string{node.Name}})
+		if err == nil {
+			n := int32(len(snaps))
+			status.NumberOfSnapshots = &n
+		}
+
+		for _, s := range lnode.StorageProviders {
+			status.StorageProviders = append(status.StorageProviders, string(s))
+		}
+
+		for _, l := range lnode.ResourceLayers {
+			status.DeviceLayers = append(status.DeviceLayers, string(l))
+		}
+
 		if clusterapi.ShouldEvacuateNode(machine) && lsatellite.Spec.DeletionPolicy == piraeusiov1.DeletionPolicyEvacuate {
 			r.log.Info("Request to evacuate node from ClusterAPI")
-			msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, lnode, r.MachineClient, machine)
+			msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, r.recorder, lnode, r.MachineClient, machine, &lsatellite.Spec.EvacuationStrategy)
 			if err != nil {
 				conds.AddError("SatelliteEvacuated", err)
 			} else if !done {
@@ -464,7 +525,7 @@ func (r *LinstorSatelliteReconciler) reconcileLinstorSatelliteState(ctx context.
 			}
 		}
 	} else {
-		conds.AddError(conditions.Available, fmt.Errorf("satellite not online"))
+		conds.AddError(conditions.Available, fmt.Errorf("%s", lnode.ConnectionStatus))
 	}
 
 	return nil
@@ -592,13 +653,13 @@ func (r *LinstorSatelliteReconciler) deleteSatellite(ctx context.Context, lsatel
 
 	if lc == nil {
 		r.log.Info("Allow Machine to drain for Satellite without cluster")
-		err := r.MachineClient.AllowMachineDrain(ctx, machine)
+		err := r.MachineClient.AllowMachineDrain(ctx, r.recorder, machine)
 		if err != nil {
 			return "", false, err
 		}
 
 		r.log.Info("Allow Machine to terminate for Satellite without cluster")
-		err = r.MachineClient.AllowMachineTermination(ctx, machine)
+		err = r.MachineClient.AllowMachineTermination(ctx, r.recorder, machine)
 		if err != nil {
 			return "", false, err
 		}
@@ -626,7 +687,7 @@ func (r *LinstorSatelliteReconciler) deleteSatellite(ctx context.Context, lsatel
 			return "", false, err
 		}
 
-		msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, &lnode, r.MachineClient, machine)
+		msg, done, err := evacuation.EvacuateSatellite(ctx, r.Client, lc.Client, r.recorder, &lnode, r.MachineClient, machine, &lsatellite.Spec.EvacuationStrategy)
 		if err != nil {
 			conds.AddError("SatelliteEvacuated", err)
 			return "", false, err
@@ -715,6 +776,7 @@ func (r *LinstorSatelliteReconciler) SetupWithManager(mgr ctrl.Manager, opts con
 	}
 
 	r.log = mgr.GetLogger().WithName("LinstorSatelliteReconciler")
+	r.recorder = mgr.GetEventRecorderFor("LinstorSatelliteReconciler")
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&piraeusiov1.LinstorSatellite{}).
